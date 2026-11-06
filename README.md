@@ -148,12 +148,28 @@ set the minimum time to `0`. Details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Troubleshooting
 
-- **Online is off**: check the device in the SERANOVA app; the SIM needs mobile data and SERA
-  Cloud Service must be on. The device keeps its cloud link alive with a ping every
-  `PING` seconds (default 600).
-- **Wrong App Key / user code**: use *Reconfigure*.
-- **Diagnostics**: device page → *Download diagnostics* shows the connection state and the last
-  frame of each kind (identifiers redacted). Attach it to issues.
+| Symptom | What to check |
+| --- | --- |
+| **Online is off** | The device in the SERANOVA app: the SIM needs mobile data and SERA Cloud Service must be on. The device keeps its cloud link alive with a ping every `PING` seconds (default 600). |
+| **"the gate did not confirm it"** | The cloud accepted the command but the device never reported the access. Check the SERANOVA event log: no entry means the device never got it; a late entry means a slow mobile link. |
+| **"the gate was operated moments ago"** | The minimum time between pulses (Options) refused a second pulse. Set it to `0` only if your gate input is "open only". |
+| **Wrong App Key / user code** | Use *Reconfigure*. |
+
+### Reporting a problem
+
+1. **Enable debug logging**: Settings → Devices & services → *Seranova Gate* → ⋮ →
+   *Enable debug logging*.
+2. Reproduce the problem (e.g. press the button once).
+3. ⋮ → *Disable debug logging*: Home Assistant downloads the log.
+4. Device page → ⋮ → **Download diagnostics**. It holds the connection state, counters, the
+   last 20 commands (with timings: cloud ack, gate confirmation), the last 20 device events
+   and the last 20 cloud disconnects.
+5. Open an [issue](https://github.com/jut-a/ha-seranova-gate/issues/new/choose) and attach
+   both files, plus what you saw at the gate.
+
+Both are designed to leave out personal data: the debug log only names frame types,
+sequence numbers and timings, and diagnostics redact the IMEI, SIM number, App Key, codes,
+e-mail and every name. Still read them once before posting.
 
 ## License
 

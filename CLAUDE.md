@@ -40,9 +40,11 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
 Automated (CI runs both on every push):
 - `pytest` — `tests/test_events.py` and `tests/test_api.py` run without Home Assistant (they load
   the HA-free modules by file path); `tests/test_pulse.py` needs `pip install -r
-  requirements_test.txt` (HA's test kit) and drives `SeranovaHub.async_pulse` through a fake
-  socket. **Its assertions encode hard rule 1 — CMD 6 is written exactly once in every
-  scenario; never weaken them to make a change pass.**
+  requirements_test.txt` (HA's test kit, **Python 3.14**; on a 3.13 host install
+  `pytest-homeassistant-custom-component==0.13.316`, the last 3.13 build) and drives
+  `SeranovaHub.async_pulse` through a fake socket. **Without the kit the module is silently
+  skipped** — check for "1 skipped". **Its assertions encode hard rule 1 — CMD 6 is written
+  exactly once in every scenario; never weaken them to make a change pass.**
 - `ruff check .` (config in `pyproject.toml`; HA-style import order, line length 100).
 - Dependabot (`.github/dependabot.yml`) opens `chore:` PRs — GitHub Actions monthly, the
   pinned test kit in `requirements_test.txt` weekly. A red test-kit bump means a new Home

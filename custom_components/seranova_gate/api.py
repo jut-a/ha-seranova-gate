@@ -382,7 +382,7 @@ class SocketIoConnection:
         try:
             args = json.loads(body[start:])
         except ValueError:
-            _LOGGER.debug("Unparsable event packet: %.200s", packet)
+            _LOGGER.debug("Unparsable event packet (%s bytes)", len(packet))
             return
         if not isinstance(args, list) or not args:
             return

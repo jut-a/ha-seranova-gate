@@ -23,6 +23,7 @@ pytest.importorskip("pytest_homeassistant_custom_component")
 from homeassistant.core import HomeAssistant  # noqa: E402
 from pytest_homeassistant_custom_component.common import MockConfigEntry  # noqa: E402
 
+from custom_components.seranova_gate import diagnostics  # noqa: E402
 from custom_components.seranova_gate import hub as hub_module  # noqa: E402
 from custom_components.seranova_gate.api import NotSent, SocketClosed  # noqa: E402
 from custom_components.seranova_gate.const import (  # noqa: E402
@@ -111,7 +112,7 @@ async def close_hubs() -> AsyncIterator[None]:
         await _HUBS.pop().async_close()
 
 
-def make_entry(lockout: int | None = None) -> MockConfigEntry:
+def make_entry(lockout: int | None = None, **extra: str) -> MockConfigEntry:
     return MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -119,6 +120,7 @@ def make_entry(lockout: int | None = None) -> MockConfigEntry:
             CONF_APP_KEY: "123456",
             CONF_USER_CODE: USER_CODE,
             CONF_SYSTEM_NAME: "Gate",
+            **extra,
         },
         options={} if lockout is None else {CONF_PULSE_LOCKOUT: lockout},
     )
@@ -332,3 +334,67 @@ async def test_access_event_reaches_listeners(hass: HomeAssistant) -> None:
     event_type, data = seen[0]
     assert event_type == "access_granted"
     assert data["message"] == "Access Gained by John (User 1)"
+
+
+# ---- diagnostics history ------------------------------------------------------
+
+
+async def test_history_records_a_confirmed_pulse(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok)
+    await hub.async_pulse(1, 2)
+
+    entry = hub.recent_commands[-1]
+    assert entry["success"] is True
+    assert entry["confirmed_by"] == "access_event"
+    assert entry["prepare_sends"] == 1
+    assert entry["pulse_seq"] == conn.written[1]["MSG"]["SEQ"]
+    assert entry["cloud_ack_after_s"] is not None
+    assert entry["confirmed_after_s"] is not None
+    assert hub.stats["pulses_confirmed"] == 1
+    assert hub.recent_events[-1]["event_type"] == "access_granted"
+
+
+async def test_history_counts_every_outcome(hass: HomeAssistant) -> None:
+    hub, _ = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])], make_entry(lockout=30))
+    await hub.async_pulse(1, 2)  # cloud ack only: unconfirmed
+    await hub.async_pulse(1, 2)  # within the lockout: refused
+
+    assert [c["stage"] for c in hub.recent_commands] == ["open", "locked"]
+    assert hub.recent_commands[0]["cloud_ack_after_s"] is not None
+    assert hub.recent_commands[0]["confirmed_after_s"] is None
+    assert hub.stats["pulses_unconfirmed"] == 1
+    assert hub.stats["pulses_refused"] == 1
+    assert hub.stats["pulses_requested"] == 2
+
+
+async def test_diagnostics_carry_no_personal_data(hass: HomeAssistant) -> None:
+    entry = make_entry(
+        lockout=0, system_name="Secret Lane Gate", email="someone@example.com", password="hunter2"
+    )
+    hub, _ = make_hub(hass, gate_ok, entry)
+    hub._handle_frames(
+        [
+            {
+                "CMD": 1,
+                "UID": IMEI,
+                "VAL": f"CON:1,IMEI:{IMEI},ICCID:8999000000000000000,APPKEY:123456,NAME:Lane Ten",
+            },
+            ACCESS_EVENT,
+        ]
+    )
+    assert (await hub.async_pulse(1, 2)).success  # the dump must hold a sent command
+    entry.runtime_data = hub
+
+    dump = str(await diagnostics.async_get_config_entry_diagnostics(hass, entry))
+    for secret in (
+        IMEI,
+        USER_CODE,
+        "8999000000000000000",
+        "Lane Ten",
+        "John",
+        "Secret Lane Gate",
+        "someone@example.com",
+        "hunter2",
+    ):
+        assert secret not in dump, secret
+    assert "recent_commands" in dump

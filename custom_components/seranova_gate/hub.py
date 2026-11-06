@@ -51,7 +51,6 @@ from .const import (
     MANUFACTURER,
     MAX_OUTPUTS,
     MODEL,
-    OK_ERRORS,
     PULSE_CONFIRM_TIMEOUT,
     RECONNECT_MIN,
     REFUSAL_ERRORS,
@@ -105,6 +104,18 @@ def outputs_from_options(options: dict[str, Any]) -> list[OutputConfig]:
         seconds = int(options.get(output_key(number, "seconds")) or DEFAULT_PULSE_SECONDS)
         outputs.append(OutputConfig(number, name, max(1, seconds)))
     return outputs
+
+
+def _frame_kind(frame: dict[str, Any]) -> str:
+    """Short, payload-free description of a frame for debug logs."""
+    parts = []
+    if (cmd := as_int(frame.get("CMD"))) is not None:
+        parts.append(f"CMD {cmd}")
+    if isinstance(ack := frame.get("ack"), dict):
+        parts.append(f"ack cmd {ack.get('cmd')}")
+    if (error := as_int(frame.get("ERROR"))) is not None:
+        parts.append(f"ERROR {error}")
+    return ", ".join(parts) or "other"
 
 
 def seq_storage_key(entry_id: str) -> str:
@@ -168,6 +179,16 @@ class _Waiter:
         self.acked = False
         # True once a write was attempted past the "not connected" check.
         self.sent = False
+        # For the diagnostics history (monotonic clock).
+        self.seq: int | None = None
+        self.attempts = 0
+        self.sent_at: float | None = None
+        self.acked_at: float | None = None
+        self.done_at: float | None = None
+
+    def _finish(self, frame: dict[str, Any]) -> None:
+        self.done_at = time.monotonic()
+        self.future.set_result(frame)
 
     def feed(self, frame: dict[str, Any]) -> None:
         if self.future.done():
@@ -183,16 +204,18 @@ class _Waiter:
             and as_int(ack.get("cmd")) == self.ack_cmd
         ):
             self.acked = True
+            if self.acked_at is None:
+                self.acked_at = time.monotonic()
             if self.reply_cmd is None and self.confirm is None:
-                self.future.set_result(frame)
+                self._finish(frame)
                 return
         if self.confirm is not None:
             if (label := self.confirm(frame)) is not None:
                 self.confirmed_by = label
-                self.future.set_result(frame)
+                self._finish(frame)
             return
         if self.reply_cmd is not None and as_int(frame.get("CMD")) == self.reply_cmd:
-            self.future.set_result(frame)
+            self._finish(frame)
 
     def fail(self, err: Exception) -> None:
         if not self.future.done():
@@ -251,8 +274,23 @@ class SeranovaHub:
         self._session_started = 0.0
         self._lost_at: float | None = None
         self._grace_unsub: CALLBACK_TYPE | None = None
-        # Last socket sessions that ended (for diagnostics).
+        # Diagnostics: what happened recently (no names, codes or identifiers).
         self.recent_sessions: deque[dict[str, Any]] = deque(maxlen=20)
+        self.recent_commands: deque[dict[str, Any]] = deque(maxlen=20)
+        self.recent_events: deque[dict[str, Any]] = deque(maxlen=20)
+        self.stats: dict[str, int] = dict.fromkeys(
+            (
+                "pulses_requested",
+                "pulses_confirmed",
+                "pulses_unconfirmed",
+                "pulses_refused",
+                "pulses_not_sent",
+                "events_received",
+                "sessions_ended",
+                "connect_failures",
+            ),
+            0,
+        )
 
     # ---- entity plumbing -------------------------------------------------
 
@@ -321,6 +359,7 @@ class SeranovaHub:
                     self._record_session_end(reason)
                 else:
                     self.last_error = reason
+                    self.stats["connect_failures"] += 1
                     log = _LOGGER.debug if self._down_logged else _LOGGER.warning
                     log("Cannot reach the SERANOVA cloud (%s); retrying", reason)
                     self._down_logged = True
@@ -351,6 +390,7 @@ class SeranovaHub:
             },
         }
         self.recent_sessions.append(entry)
+        self.stats["sessions_ended"] += 1
         _LOGGER.debug("Cloud session ended: %s", entry)
 
     async def _connect_and_read(self) -> None:
@@ -385,6 +425,9 @@ class SeranovaHub:
             _LOGGER.info("SERANOVA cloud connection restored")
             self.last_error = None
         self._down_logged = False
+        _LOGGER.debug(
+            "Cloud session established (ping every %s ms)", conn.greeting.get("pingInterval")
+        )
         self._notify()
         self.entry.async_create_background_task(
             self.hass, self.async_poll(), f"{DOMAIN} poll after connect"
@@ -440,6 +483,7 @@ class SeranovaHub:
                 continue
             cmd = as_int(frame.get("CMD"))
             error = as_int(frame.get("ERROR"))
+            _LOGGER.debug("Frame received: %s", _frame_kind(frame))
             if cmd is not None:
                 key = f"CMD{cmd}"
             elif "ack" in frame:
@@ -454,8 +498,6 @@ class SeranovaHub:
             elif error in REFUSAL_ERRORS:
                 self.last_error = REFUSAL_ERRORS[error]
                 changed = True
-            elif error is not None and error not in OK_ERRORS:
-                _LOGGER.debug("Cloud frame with ERROR %s: %s", error, frame)
 
             if cmd is not None and error != ERR_DEVICE_OFFLINE:
                 self.last_seen = dt_util.utcnow()
@@ -477,6 +519,17 @@ class SeranovaHub:
         event_type, data = parse_event(event if isinstance(event, dict) else {})
         if event_type == "access_granted":
             self._last_access_at = time.monotonic()
+        self.stats["events_received"] += 1
+        self.recent_events.append(
+            {
+                "received": dt_util.utcnow().isoformat(),
+                "event_type": event_type,
+                **{
+                    key: data.get(key)
+                    for key in ("code", "partition", "user_or_zone", "device_time")
+                },
+            }
+        )
         for handler in list(self._event_listeners):
             handler(event_type, data)
         self.hass.bus.async_fire(
@@ -540,9 +593,14 @@ class SeranovaHub:
         interval = SEND_INTERVAL if interval is None else interval
         conn = await self._ensure_connected()
         frame = build_frame(self.imei, self._app_key, self._next_seq(), cmd, val, code)
+        waiter.seq = frame["MSG"]["SEQ"]
         self._waiters.add(waiter)
         try:
-            for _ in range(retries + 1):
+            for attempt in range(1, retries + 2):
+                waiter.attempts = attempt
+                _LOGGER.debug(
+                    "Sending CMD %s seq %s (attempt %s/%s)", cmd, waiter.seq, attempt, retries + 1
+                )
                 try:
                     await conn.emit(frame)
                 except NotSent:
@@ -551,6 +609,8 @@ class SeranovaHub:
                     waiter.sent = True  # the write may still have reached the server
                     raise
                 waiter.sent = True
+                if waiter.sent_at is None:
+                    waiter.sent_at = time.monotonic()
                 try:
                     async with asyncio.timeout(interval):
                         return await asyncio.shield(waiter.future)
@@ -566,7 +626,59 @@ class SeranovaHub:
 
         Success needs the device's own access event; a pulse within the lockout
         of the previous one (or of any access the device reported) is refused.
+        Every attempt is recorded for the diagnostics.
         """
+        # Timed from the request: a press queued behind another pulse counts its wait.
+        started = time.monotonic()
+        started_wall = dt_util.utcnow()
+        trace: dict[str, _Waiter] = {}
+        result = await self._pulse(output, seconds, trace)
+        self._record_pulse(output, seconds, result, trace, started, started_wall)
+        return result
+
+    @callback
+    def _record_pulse(
+        self,
+        output: int,
+        seconds: int,
+        result: CommandResult,
+        trace: dict[str, _Waiter],
+        started: float,
+        started_wall: datetime,
+    ) -> None:
+        def after(mark: float | None) -> float | None:
+            return None if mark is None else round(mark - started, 2)
+
+        prepare, pulse = trace.get("prepare"), trace.get("pulse")
+        entry = {
+            "time": started_wall.isoformat(),
+            "output": output,
+            "seconds": seconds,
+            "success": result.success,
+            "stage": result.stage,
+            "fallback_safe": result.fallback_safe,
+            "confirmed_by": result.confirmed_by,
+            "error": result.error,
+            "prepare_sends": prepare.attempts if prepare else 0,
+            "prepare_acked_after_s": after(prepare.done_at) if prepare else None,
+            "pulse_seq": pulse.seq if pulse and pulse.sent else None,
+            "pulse_sent_after_s": after(pulse.sent_at) if pulse else None,
+            "cloud_ack_after_s": after(pulse.acked_at) if pulse else None,
+            "confirmed_after_s": after(pulse.done_at) if pulse and result.success else None,
+        }
+        self.recent_commands.append(entry)
+        self.stats["pulses_requested"] += 1
+        if result.success:
+            self.stats["pulses_confirmed"] += 1
+        elif result.stage == "locked":
+            self.stats["pulses_refused"] += 1
+        elif result.fallback_safe:  # the output command was never delivered
+            self.stats["pulses_not_sent"] += 1
+        else:
+            self.stats["pulses_unconfirmed"] += 1
+        _LOGGER.debug("Pulse result: %s", entry)
+
+    async def _pulse(self, output: int, seconds: int, trace: dict[str, _Waiter]) -> CommandResult:
         async with self._cmd_lock:
             if (wait := self._lockout_remaining()) > 0:
                 return CommandResult(
@@ -579,8 +691,9 @@ class SeranovaHub:
             except SeranovaError as err:
                 return CommandResult(False, "connect", str(err), fallback_safe=True)
 
+            trace["prepare"] = _Waiter(CMD_PREPARE)
             try:
-                await self._send(CMD_PREPARE, None, None, _Waiter(CMD_PREPARE))
+                await self._send(CMD_PREPARE, None, None, trace["prepare"])
             except DeviceRefused as err:
                 return CommandResult(False, "wake", str(err), fallback_safe=True)
             except CommandTimeout:
@@ -598,7 +711,7 @@ class SeranovaHub:
             # CMD 10 that never came) opened the gate twice, 4 s apart. The web app
             # re-sends too but gets CMD 10 quickly because its page subscribes to
             # state. Success needs the device's access event, not the cloud's ack.
-            waiter = _Waiter(CMD_OUTPUT_PULSE, confirm=pulse_confirmation)
+            waiter = trace["pulse"] = _Waiter(CMD_OUTPUT_PULSE, confirm=pulse_confirmation)
             try:
                 await self._send(
                     CMD_OUTPUT_PULSE,
@@ -631,7 +744,6 @@ class SeranovaHub:
             finally:
                 if waiter.sent:
                     self._last_pulse_at = time.monotonic()
-            _LOGGER.debug("Output %s pulse confirmed by %s", output, waiter.confirmed_by)
             return CommandResult(
                 True, "open", acked=waiter.acked, confirmed_by=waiter.confirmed_by
             )

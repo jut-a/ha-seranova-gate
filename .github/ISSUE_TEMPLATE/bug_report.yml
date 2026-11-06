@@ -1,0 +1,57 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The two attachments below answer most questions; both are
+        designed to leave out personal data, but please read them once before posting.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what the gate actually did.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Integration version
+      description: Settings → Devices & services → Seranova Gate (e.g. 0.2.2)
+    validations:
+      required: true
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      description: Settings → About (e.g. 2026.11.0)
+    validations:
+      required: true
+  - type: dropdown
+    id: gate_input
+    attributes:
+      label: Gate input the PROGATE relay drives
+      options:
+        - Open / stop / close (step by step)
+        - Open only
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: seranova_log
+    attributes:
+      label: SERANOVA event log
+      description: The matching entries from the SERANOVA app or web event log (times and texts; remove names if you like).
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Device page → ⋮ → Download diagnostics. Drag the file here.
+    validations:
+      required: true
+  - type: textarea
+    id: debug_log
+    attributes:
+      label: Debug log
+      description: Integration page → ⋮ → Enable debug logging, reproduce, then Disable debug logging. Drag the downloaded file here.
