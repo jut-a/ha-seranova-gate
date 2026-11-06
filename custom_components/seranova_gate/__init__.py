@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import timedelta
+import logging
 
-import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import (
@@ -24,6 +23,7 @@ from homeassistant.exceptions import (
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
+import voluptuous as vol
 
 from .api import (
     CannotConnect,

@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Action versions in .github/workflows (hacs/action@main and
+  # home-assistant/actions/hassfest@master follow branches on purpose).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Home Assistant's test kit (pins a Home Assistant release): a red CI on its
+  # bump PR is the early warning that a new Home Assistant breaks the integration.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    open-pull-requests-limit: 2

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import logging
-import time
 from collections import deque
 from collections.abc import Callable
+import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime
+import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -465,10 +465,13 @@ class SeranovaHub:
         val: Any,
         code: str | None,
         waiter: _Waiter,
-        retries: int = SEND_RETRIES,
-        interval: float = SEND_INTERVAL,
+        retries: int | None = None,
+        interval: float | None = None,
     ) -> dict[str, Any]:
         """Send a frame, re-sending the same frame (same SEQ) until it is answered."""
+        # Defaults resolved at call time (tests shorten them on the module).
+        retries = SEND_RETRIES if retries is None else retries
+        interval = SEND_INTERVAL if interval is None else interval
         conn = await self._ensure_connected()
         frame = build_frame(self.imei, self._app_key, self._next_seq(), cmd, val, code)
         self._waiters.add(waiter)

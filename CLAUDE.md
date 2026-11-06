@@ -34,7 +34,18 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
 
 ## Testing
 
-There is no simulator; test against a real device while someone watches the gate.
+Automated (CI runs both on every push):
+- `pytest` — `tests/test_events.py` and `tests/test_api.py` run without Home Assistant (they load
+  the HA-free modules by file path); `tests/test_pulse.py` needs `pip install -r
+  requirements_test.txt` (HA's test kit) and drives `SeranovaHub.async_pulse` through a fake
+  socket. **Its assertions encode hard rule 1 — CMD 6 is written exactly once in every
+  scenario; never weaken them to make a change pass.**
+- `ruff check .` (config in `pyproject.toml`; HA-style import order, line length 100).
+- Dependabot (`.github/dependabot.yml`) opens `chore:` PRs — GitHub Actions monthly, the
+  pinned test kit in `requirements_test.txt` weekly. A red test-kit bump means a new Home
+  Assistant release breaks the integration: fix the code, don't pin the kit back.
+
+Live: there is no simulator; test against a real device while someone watches the gate.
 - Install into a HA instance by symlinking `custom_components/seranova_gate` into its
   `config/custom_components/`, then **restart HA** (a config-entry reload does not re-import
   Python modules).

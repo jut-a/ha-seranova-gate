@@ -16,12 +16,12 @@ they are split the same way the web app does before parsing.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import contextlib
 import json
 import logging
 import re
 import time
-from collections.abc import Callable
 from typing import Any
 
 import aiohttp

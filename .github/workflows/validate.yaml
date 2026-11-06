@@ -22,3 +22,27 @@ jobs:
           category: integration
           # Until custom_components/seranova_gate/brand/icon.png exists.
           ignore: brands
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check --output-format github .
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Current Home Assistant (and its test kit) needs Python 3.14.
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements_test.txt
+      - run: pip install -r requirements_test.txt
+      # Includes tests/test_pulse.py: CMD 6 must be written exactly once.
+      - run: pytest -q

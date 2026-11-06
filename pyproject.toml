@@ -1,0 +1,22 @@
+[project]
+name = "ha-seranova-gate"
+version = "0.2.0"
+description = "Home Assistant integration for the Topkodas PROGATE gate controller (SERANOVA cloud)"
+requires-python = ">=3.13"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+# Explicit timeout parameters on the socket helpers are intentional.
+ignore = ["ASYNC109"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["custom_components"]
