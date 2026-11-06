@@ -16,6 +16,7 @@ import aiohttp
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
 from .api import (
@@ -37,11 +38,12 @@ from .const import (
     CMD_INFO,
     CMD_OUTPUT_PULSE,
     CMD_PREPARE,
-    CMD_SYSTEM,
     CONF_APP_KEY,
     CONF_IMEI,
+    CONF_PULSE_LOCKOUT,
     CONF_SYSTEM_NAME,
     CONF_USER_CODE,
+    DEFAULT_PULSE_LOCKOUT,
     DEFAULT_PULSE_SECONDS,
     DOMAIN,
     ERR_DEVICE_OFFLINE,
@@ -55,6 +57,11 @@ from .const import (
     REFUSAL_ERRORS,
     SEND_INTERVAL,
     SEND_RETRIES,
+    SEQ_MAX,
+    SEQ_MIN,
+    SEQ_RESTART_GAP,
+    SEQ_SAVE_DELAY,
+    SEQ_STORAGE_VERSION,
     WEB_BASE,
     output_key,
 )
@@ -100,19 +107,41 @@ def outputs_from_options(options: dict[str, Any]) -> list[OutputConfig]:
     return outputs
 
 
+def seq_storage_key(entry_id: str) -> str:
+    """Storage key of one entry's frame counter."""
+    return f"{DOMAIN}.{entry_id}.seq"
+
+
+def pulse_confirmation(frame: dict[str, Any]) -> str | None:
+    """What proves a pulse reached the device: its own access-granted event.
+
+    The cloud acks CMD 6 within a fraction of a second whether or not the device
+    ever gets it, and CMD 10 status frames also arrive while an app polls, so
+    neither counts.
+    """
+    if as_int(frame.get("CMD")) != CMD_EVENT:
+        return None
+    event = frame.get("EVENT")
+    if isinstance(event, dict) and parse_event(event)[0] == "access_granted":
+        return "access_event"
+    return None
+
+
 @dataclass(slots=True)
 class CommandResult:
     """Outcome of an output command.
 
+    success is True only when the device itself reported the access.
     fallback_safe is True only when the output command itself was never
     delivered, so another channel (SMS, call) cannot cause a second pulse.
     """
 
     success: bool
-    stage: str | None = None  # "connect", "wake" or "open"
+    stage: str | None = None  # "locked", "connect", "wake" or "open"
     error: str | None = None
     fallback_safe: bool = False
-    acked: bool = False
+    acked: bool = False  # the cloud acknowledged CMD 6 (not proof of delivery)
+    confirmed_by: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Service response."""
@@ -126,14 +155,16 @@ class _Waiter:
         self,
         ack_cmd: int | None,
         reply_cmd: int | None = None,
-        also_done_on: tuple[int, ...] = (),
+        confirm: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> None:
+        """Done on the ack, on a reply_cmd frame, or (when given) only on confirm."""
         self.future: asyncio.Future[dict[str, Any]] = (
             asyncio.get_running_loop().create_future()
         )
         self.ack_cmd = ack_cmd
         self.reply_cmd = reply_cmd
-        self.also_done_on = also_done_on
+        self.confirm = confirm
+        self.confirmed_by: str | None = None
         self.acked = False
         # True once a write was attempted past the "not connected" check.
         self.sent = False
@@ -152,13 +183,15 @@ class _Waiter:
             and as_int(ack.get("cmd")) == self.ack_cmd
         ):
             self.acked = True
-            if self.reply_cmd is None:
+            if self.reply_cmd is None and self.confirm is None:
                 self.future.set_result(frame)
                 return
-        cmd = as_int(frame.get("CMD"))
-        if (self.reply_cmd is not None and cmd == self.reply_cmd) or (
-            cmd is not None and cmd in self.also_done_on
-        ):
+        if self.confirm is not None:
+            if (label := self.confirm(frame)) is not None:
+                self.confirmed_by = label
+                self.future.set_result(frame)
+            return
+        if self.reply_cmd is not None and as_int(frame.get("CMD")) == self.reply_cmd:
             self.future.set_result(frame)
 
     def fail(self, err: Exception) -> None:
@@ -201,7 +234,13 @@ class SeranovaHub:
 
         self._conn: SocketIoConnection | None = None
         self._connected = asyncio.Event()
-        self._seq = 0
+        self._seq = SEQ_MIN
+        self._seq_store: Store[dict[str, int]] = Store(
+            hass, SEQ_STORAGE_VERSION, seq_storage_key(entry.entry_id)
+        )
+        self._lockout = int(entry.options.get(CONF_PULSE_LOCKOUT, DEFAULT_PULSE_LOCKOUT))
+        self._last_pulse_at: float | None = None
+        self._last_access_at: float | None = None
         self._cmd_lock = asyncio.Lock()
         self._waiters: set[_Waiter] = set()
         self._listeners: list[Callable[[], None]] = []
@@ -388,6 +427,7 @@ class SeranovaHub:
         conn = self._conn
         if conn is not None:
             await conn.close()
+        await self._seq_store.async_save(self._seq_data())
 
     # ---- incoming frames -------------------------------------------------
 
@@ -435,6 +475,8 @@ class SeranovaHub:
     def _dispatch_event(self, frame: dict[str, Any]) -> None:
         event = frame.get("EVENT")
         event_type, data = parse_event(event if isinstance(event, dict) else {})
+        if event_type == "access_granted":
+            self._last_access_at = time.monotonic()
         for handler in list(self._event_listeners):
             handler(event_type, data)
         self.hass.bus.async_fire(
@@ -444,10 +486,34 @@ class SeranovaHub:
 
     # ---- commands --------------------------------------------------------
 
+    async def async_load_seq(self) -> None:
+        """Continue the frame counter where the last run stopped; never reuse a SEQ."""
+        data = await self._seq_store.async_load()
+        stored = data.get("seq") if isinstance(data, dict) else None
+        if isinstance(stored, int):
+            start = stored + SEQ_RESTART_GAP
+        else:  # first run: a time-based start no earlier run can have used
+            start = SEQ_MIN + int(time.time()) % (SEQ_MAX - SEQ_MIN - SEQ_RESTART_GAP)
+        self._seq = start if SEQ_MIN <= start < SEQ_MAX else SEQ_MIN
+        await self._seq_store.async_save(self._seq_data())
+
+    def _seq_data(self) -> dict[str, int]:
+        return {"seq": self._seq}
+
     def _next_seq(self) -> int:
         seq = self._seq
-        self._seq += 1
+        self._seq = seq + 1 if seq + 1 < SEQ_MAX else SEQ_MIN
+        self._seq_store.async_delay_save(self._seq_data, SEQ_SAVE_DELAY)
         return seq
+
+    def _lockout_remaining(self) -> float:
+        """Seconds until another pulse is allowed (0 = allowed)."""
+        if self._lockout <= 0:
+            return 0
+        recent = [t for t in (self._last_pulse_at, self._last_access_at) if t is not None]
+        if not recent:
+            return 0
+        return max(0.0, self._lockout - (time.monotonic() - max(recent)))
 
     async def _ensure_connected(self, timeout: float = 15) -> SocketIoConnection:
         if self._conn is None or not self._conn.connected:
@@ -496,8 +562,18 @@ class SeranovaHub:
             waiter.discard()
 
     async def async_pulse(self, output: int, seconds: int) -> CommandResult:
-        """Pulse an output: CMD 2 (re-sent until acked), then CMD 6 sent once."""
+        """Pulse an output: CMD 2 (re-sent until acked), then CMD 6 sent once.
+
+        Success needs the device's own access event; a pulse within the lockout
+        of the previous one (or of any access the device reported) is refused.
+        """
         async with self._cmd_lock:
+            if (wait := self._lockout_remaining()) > 0:
+                return CommandResult(
+                    False,
+                    "locked",
+                    f"the gate was operated moments ago; next pulse allowed in {wait:.0f} s",
+                )
             try:
                 await self._ensure_connected()
             except SeranovaError as err:
@@ -521,8 +597,8 @@ class SeranovaHub:
             # with the same SEQ: in testing, re-sending every second (waiting for a
             # CMD 10 that never came) opened the gate twice, 4 s apart. The web app
             # re-sends too but gets CMD 10 quickly because its page subscribes to
-            # state; this client stops at the ack or the access event.
-            waiter = _Waiter(CMD_OUTPUT_PULSE, also_done_on=(CMD_SYSTEM, CMD_EVENT))
+            # state. Success needs the device's access event, not the cloud's ack.
+            waiter = _Waiter(CMD_OUTPUT_PULSE, confirm=pulse_confirmation)
             try:
                 await self._send(
                     CMD_OUTPUT_PULSE,
@@ -534,6 +610,14 @@ class SeranovaHub:
                 )
             except DeviceRefused as err:
                 return CommandResult(False, "open", str(err), fallback_safe=True)
+            except CommandTimeout:
+                reason = (
+                    "the cloud accepted the command but the gate did not confirm it; "
+                    "it may still open late, or not at all"
+                    if waiter.acked
+                    else "no answer from the cloud or the gate"
+                )
+                return CommandResult(False, "open", reason, acked=waiter.acked)
             except SeranovaError as err:
                 if not waiter.sent:
                     # Never written to the socket, so it cannot have reached the device.
@@ -544,8 +628,13 @@ class SeranovaHub:
                     f"sent but not confirmed ({err}); the output may have switched",
                     acked=waiter.acked,
                 )
-            _LOGGER.debug("Output %s pulsed for %ss", output, seconds)
-            return CommandResult(True, "open", acked=waiter.acked)
+            finally:
+                if waiter.sent:
+                    self._last_pulse_at = time.monotonic()
+            _LOGGER.debug("Output %s pulse confirmed by %s", output, waiter.confirmed_by)
+            return CommandResult(
+                True, "open", acked=waiter.acked, confirmed_by=waiter.confirmed_by
+            )
 
     async def async_poll(self, _now: datetime | None = None) -> None:
         """Ask the device for its info so the Online sensor stays current."""

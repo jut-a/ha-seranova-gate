@@ -31,6 +31,8 @@ Control a **Topkodas PROGATE** cellular gate controller from Home Assistant thro
 - A SERANOVA account that signs in with **e-mail and password**. Google / Apple sign-in and
   two-factor authentication are not supported.
 - Home Assistant 2025.3 or newer (tested on 2026.11).
+- Access events must be reported by the device (the default): an open counts as successful
+  only when the PROGATE reports "Access Gained" (Contact ID 422).
 
 ## Installation
 
@@ -68,7 +70,8 @@ Or: Settings → Devices & services → **Add integration** → *Seranova Gate*.
 | Access codes | **App Key**: the device's SERA Cloud Service key (factory default `123456` — change it). **User code**: your code in the device's user table, the one the SERANOVA app uses. |
 
 **Options** (⚙ on the integration): enable/name up to four outputs and set each pulse length
-(default: output 1 "Gate", 2 s), and the status poll interval (default 10 min, `0` = off).
+(default: output 1 "Gate", 2 s), the status poll interval (default 10 min, `0` = off) and the
+**minimum time between pulses** (default 30 s, `0` = off; see Safety).
 **Reconfigure** changes the login, the codes or the name; if the password stops working,
 Home Assistant asks you to sign in again.
 
@@ -91,10 +94,12 @@ data:
 response_variable: gate
 ```
 
-The response is `{success, stage, error, fallback_safe, acked}`. `stage` is `connect`,
-`wake` or `open`. **`fallback_safe` is `true` only when the output command never reached the
-device.** If the command was sent but not confirmed, the gate may already be moving — sending
-another pulse (by SMS, call or a retry) can stop or reverse it.
+The response is `{success, stage, error, fallback_safe, acked, confirmed_by}`. `stage` is
+`locked`, `connect`, `wake` or `open`. `success` is `true` only when the gate itself reported
+the access (`confirmed_by: access_event`); `acked` only says the cloud accepted the command,
+which is **not** proof that the gate got it. **`fallback_safe` is `true` only when the output
+command never reached the device.** If the command was sent but not confirmed, the gate may
+still move — sending another pulse (by SMS, call or a retry) can stop or reverse it.
 
 Example: open from the cloud, fall back to an SMS only when that cannot double-trigger:
 
@@ -124,12 +129,22 @@ actions:
       message: "{{ trigger.to_state.attributes.message }}"
 ```
 
-## Safety: why the output command is never retried
+## Safety
 
-The device does **not** de-duplicate a re-sent output command. The official web app re-sends
-every second until it sees a state update; when that update is slow, the gate receives two
-pulses. This integration sends the output command **exactly once** and only retries the
-harmless "prepare" step before it. Details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+Many gate motors take the PROGATE pulse on an **open → stop → close** input, so every extra
+pulse stops or reverses the gate. The integration therefore:
+
+- sends the output command **exactly once** — the device does not de-duplicate a re-sent
+  command, so a retry would pulse the gate again; only the harmless "prepare" step is retried;
+- reports **success only when the gate itself reports the access** — the cloud acknowledges a
+  command within a fraction of a second even when the device never receives it;
+- never reuses a frame sequence number (SEQ), also across restarts — reusing one made the
+  device skip a command, or run it several times;
+- refuses a new pulse for the **minimum time between pulses** (default 30 s) after the last
+  pulse or after any access the device reported (app, SMS, key fob).
+
+If your PROGATE relay is wired to an "open only" input, extra pulses are harmless and you can
+set the minimum time to `0`. Details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Troubleshooting
 

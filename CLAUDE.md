@@ -24,6 +24,9 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
    the same SEQ; a retry pulses the output again, which stops or reverses a gate. CMD 2
    ("prepare", no CODE) is the only command that may be retried. If you change the command
    path, keep `CommandResult.fallback_safe` meaning "the output command was never delivered".
+   Also: success only on the device's CMD 14 access event (the cloud ack is not delivery),
+   never reuse a SEQ (the counter is stored per entry and survives restarts), and keep the
+   minimum time between pulses — open/stop/close gate inputs are common.
 2. **No personal data in the repo**: no IMEI, ICCID, App Key, user codes, phone numbers,
    e-mail addresses, real names or captured diagnostics — in code, tests, docs, commits or
    issue text. Use placeholders (`864000000000000`, `John`).
@@ -60,7 +63,7 @@ Live: there is no simulator; test against a real device while someone watches th
 
 1. Bump `version` in `custom_components/seranova_gate/manifest.json` (semver; 0.x until the
    integration has been tested in the field — first public version 0.2.0).
-2. Commit, tag **exactly the manifest version** (`0.2.0`, no `v` prefix — the Home Assistant
+2. Commit, tag **exactly the manifest version** (e.g. `0.2.1`, no `v` prefix — the Home Assistant
    Marketplace expects the tag and `version` to match), push, and publish a GitHub release with
    notes; the Marketplace / HACS offer releases as updates.
 3. The Validate workflow must be green (hassfest + HACS).

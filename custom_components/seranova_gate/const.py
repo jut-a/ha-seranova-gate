@@ -21,10 +21,14 @@ CONF_APP_KEY: Final = "app_key"
 CONF_USER_CODE: Final = "user_code"
 CONF_SYSTEM_NAME: Final = "system_name"
 CONF_POLL_MINUTES: Final = "poll_minutes"
+CONF_PULSE_LOCKOUT: Final = "pulse_lockout"
 
 DEFAULT_APP_KEY: Final = "123456"
 DEFAULT_POLL_MINUTES: Final = 10
 DEFAULT_PULSE_SECONDS: Final = 2
+# Minimum seconds between two pulses (also after any access the device reports):
+# on an open/stop/close gate input a second pulse stops or reverses the gate.
+DEFAULT_PULSE_LOCKOUT: Final = 30
 MAX_OUTPUTS: Final = 4
 
 # Frame CMD numbers (MSG.CMD when sending, CMD when receiving).
@@ -51,8 +55,17 @@ REFUSAL_ERRORS: Final = {
 # Used for CMD 2 (prepare) only: re-sending CMD 6 makes the device pulse again.
 SEND_RETRIES: Final = 10
 SEND_INTERVAL: Final = 1.0
-# CMD 6 is sent once and waits this long for its ack / the access event.
+# CMD 6 is sent once and waits this long for the device's access event; the
+# cloud's ack alone does not prove the device got the command.
 PULSE_CONFIRM_TIMEOUT: Final = 10.0
+
+# Frame counter (SEQ): stored across restarts and never reused. Reusing a small
+# SEQ after a restart made the device skip a CMD 6, or run it several times.
+SEQ_STORAGE_VERSION: Final = 1
+SEQ_MIN: Final = 1000
+SEQ_MAX: Final = 60000
+SEQ_RESTART_GAP: Final = 100  # skip values a crash may have used before saving
+SEQ_SAVE_DELAY: Final = 10
 
 # Reconnect this soon after a working session ends; failed attempts back off to 300 s.
 RECONNECT_MIN: Final = 2
@@ -83,6 +96,7 @@ def output_key(number: int, field: str) -> str:
 
 DEFAULT_OPTIONS: Final[dict] = {
     CONF_POLL_MINUTES: DEFAULT_POLL_MINUTES,
+    CONF_PULSE_LOCKOUT: DEFAULT_PULSE_LOCKOUT,
     **{
         key: value
         for n in range(1, MAX_OUTPUTS + 1)

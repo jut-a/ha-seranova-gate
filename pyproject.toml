@@ -1,6 +1,6 @@
 [project]
 name = "ha-seranova-gate"
-version = "0.2.0"
+version = "0.2.1"
 description = "Home Assistant integration for the Topkodas PROGATE gate controller (SERANOVA cloud)"
 requires-python = ">=3.13"
 

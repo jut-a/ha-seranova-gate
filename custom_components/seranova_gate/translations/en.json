@@ -65,9 +65,10 @@
     "step": {
       "init": {
         "title": "Outputs and status polling",
-        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off.",
+        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off. The minimum time between pulses refuses a new pulse that soon after the last one or after any access the device reported: on an open/stop/close gate a second pulse stops or reverses it (0 turns the protection off).",
         "data": {
           "poll_minutes": "Status poll interval",
+          "pulse_lockout": "Minimum time between pulses",
           "out1_enabled": "Output 1 enabled",
           "out1_name": "Output 1 name",
           "out1_seconds": "Output 1 pulse length",
@@ -120,7 +121,7 @@
   "services": {
     "open": {
       "name": "Pulse output",
-      "description": "Pulses a PROGATE output through the SERANOVA cloud, the same way the app does. With a response variable it returns success, stage, error and fallback_safe (true only when the output command was never delivered, so an SMS fallback cannot cause a second pulse).",
+      "description": "Pulses a PROGATE output through the SERANOVA cloud. Success needs the device's own access event. With a response variable it returns success, stage (locked, connect, wake or open), error, acked, confirmed_by and fallback_safe (true only when the output command was never delivered, so an SMS fallback cannot cause a second pulse).",
       "fields": {
         "config_entry_id": {
           "name": "System",

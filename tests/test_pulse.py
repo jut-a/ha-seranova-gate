@@ -1,4 +1,10 @@
-"""The gate command path: CMD 6 must be written exactly once, never retried.
+"""The gate command path.
+
+Hard rules checked here:
+- CMD 6 is written exactly once, never retried;
+- success needs the device's own access event (the cloud's ack is not enough);
+- a SEQ is never reused, also across a restart;
+- a second pulse within the lockout is refused (open/stop/close gates).
 
 A fake socket records every frame the hub writes and answers with scripted
 frames. Needs Home Assistant's test kit (pytest-homeassistant-custom-component).
@@ -7,7 +13,7 @@ frames. Needs Home Assistant's test kit (pytest-homeassistant-custom-component).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
@@ -22,9 +28,12 @@ from custom_components.seranova_gate.api import NotSent, SocketClosed  # noqa: E
 from custom_components.seranova_gate.const import (  # noqa: E402
     CONF_APP_KEY,
     CONF_IMEI,
+    CONF_PULSE_LOCKOUT,
     CONF_SYSTEM_NAME,
     CONF_USER_CODE,
     DOMAIN,
+    SEQ_MAX,
+    SEQ_MIN,
 )
 
 IMEI = "864000000000000"
@@ -58,6 +67,9 @@ class FakeConnection:
     def count(self, cmd: int) -> int:
         return sum(1 for frame in self.written if frame["MSG"]["CMD"] == cmd)
 
+    def seqs(self) -> list[int]:
+        return [frame["MSG"]["SEQ"] for frame in self.written]
+
 
 def ack(cmd: int) -> dict[str, Any]:
     return {"ack": {"cmd": cmd}, "UID": IMEI}
@@ -68,6 +80,17 @@ ACCESS_EVENT = {
     "UID": IMEI,
     "EVENT": {"CID": "142200001", "TXT": "Object Name\nAccess Gained by\nJohn\nUser 1\n"},
 }
+STATUS = {"CMD": 10, "UID": IMEI, "OUT": "000,010,020,030"}
+
+
+def gate_ok(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """A device that works: CMD 2 acked, CMD 6 acked by the cloud + access event."""
+    cmd = frame["MSG"]["CMD"]
+    if cmd == 2:
+        return [ack(2)]
+    if cmd == 6:
+        return [ack(6), ACCESS_EVENT]
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -77,8 +100,19 @@ def fast_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(hub_module, "PULSE_CONFIRM_TIMEOUT", 0.05)
 
 
-def make_hub(hass: HomeAssistant, script: Script) -> tuple[hub_module.SeranovaHub, FakeConnection]:
-    entry = MockConfigEntry(
+_HUBS: list[hub_module.SeranovaHub] = []
+
+
+@pytest.fixture(autouse=True)
+async def close_hubs() -> AsyncIterator[None]:
+    """Close every hub (flushes its delayed SEQ save, so no timer lingers)."""
+    yield
+    while _HUBS:
+        await _HUBS.pop().async_close()
+
+
+def make_entry(lockout: int | None = None) -> MockConfigEntry:
+    return MockConfigEntry(
         domain=DOMAIN,
         data={
             CONF_IMEI: IMEI,
@@ -86,35 +120,61 @@ def make_hub(hass: HomeAssistant, script: Script) -> tuple[hub_module.SeranovaHu
             CONF_USER_CODE: USER_CODE,
             CONF_SYSTEM_NAME: "Gate",
         },
+        options={} if lockout is None else {CONF_PULSE_LOCKOUT: lockout},
     )
-    hub = hub_module.SeranovaHub(hass, entry, session=None, web=None)  # type: ignore[arg-type]
+
+
+def make_hub(
+    hass: HomeAssistant, script: Script, entry: MockConfigEntry | None = None
+) -> tuple[hub_module.SeranovaHub, FakeConnection]:
+    hub = hub_module.SeranovaHub(hass, entry or make_entry(), session=None, web=None)  # type: ignore[arg-type]
     conn = FakeConnection(hub, script)
     hub._conn = conn  # type: ignore[assignment]
     hub.cloud_connected = True
     hub._connected.set()
+    _HUBS.append(hub)
     return hub, conn
 
 
-async def test_success_writes_cmd6_once(hass: HomeAssistant) -> None:
-    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
-        cmd = frame["MSG"]["CMD"]
-        if cmd == 2:
-            return [ack(2)]
-        if cmd == 6:
-            return [ack(6), ACCESS_EVENT]
-        return None
+# ---- single write of CMD 6 -------------------------------------------------
 
-    hub, conn = make_hub(hass, script)
+
+async def test_success_needs_the_access_event(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok)
     result = await hub.async_pulse(1, 2)
 
     assert result.success
-    assert result.acked
+    assert result.confirmed_by == "access_event"
     assert conn.count(2) == 1
     assert conn.count(6) == 1
     prepare, pulse = conn.written
     assert "CODE" not in prepare["MSG"]
     assert pulse["MSG"]["CODE"] == USER_CODE
     assert pulse["MSG"]["VAL"] == "1#2#"
+
+
+async def test_cloud_ack_alone_is_not_success(hass: HomeAssistant) -> None:
+    """The 2026-11-06 21:38 case: cloud acked in 0.2 s, the gate never moved."""
+    hub, conn = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])])
+    result = await hub.async_pulse(1, 2)
+
+    assert not result.success
+    assert result.acked
+    assert result.stage == "open"
+    assert result.fallback_safe is False  # it may still open late
+    assert "did not confirm" in (result.error or "")
+    assert conn.count(6) == 1
+
+
+async def test_status_frame_is_not_confirmation(hass: HomeAssistant) -> None:
+    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        return [ack(2)] if frame["MSG"]["CMD"] == 2 else [ack(6), STATUS]
+
+    hub, conn = make_hub(hass, script)
+    result = await hub.async_pulse(1, 2)
+
+    assert not result.success
+    assert conn.count(6) == 1
 
 
 async def test_unanswered_cmd6_is_not_retried(hass: HomeAssistant) -> None:
@@ -182,6 +242,83 @@ async def test_wrong_user_code_is_not_retried(hass: HomeAssistant) -> None:
     assert result.fallback_safe is True
     assert "user code" in (result.error or "")
     assert conn.count(6) == 1
+
+
+# ---- lockout (open/stop/close gates) -----------------------------------------
+
+
+async def test_second_pulse_within_lockout_is_refused(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok, make_entry(lockout=30))
+    assert (await hub.async_pulse(1, 2)).success
+
+    second = await hub.async_pulse(1, 2)
+    assert not second.success
+    assert second.stage == "locked"
+    assert second.fallback_safe is False  # an SMS now would stop the moving gate
+    assert conn.count(6) == 1
+
+
+async def test_lockout_also_follows_an_unconfirmed_pulse(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])], make_entry(lockout=30))
+    assert not (await hub.async_pulse(1, 2)).success  # sent, may still open late
+
+    assert (await hub.async_pulse(1, 2)).stage == "locked"
+    assert conn.count(6) == 1
+
+
+async def test_lockout_after_an_access_from_elsewhere(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok, make_entry(lockout=30))
+    hub._handle_frames([ACCESS_EVENT])  # opened by the app / SMS / a key fob
+
+    result = await hub.async_pulse(1, 2)
+    assert result.stage == "locked"
+    assert conn.written == []  # not even CMD 2
+
+
+async def test_lockout_zero_disables_it(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok, make_entry(lockout=0))
+    assert (await hub.async_pulse(1, 2)).success
+    assert (await hub.async_pulse(1, 2)).success
+    assert conn.count(6) == 2
+
+
+# ---- SEQ is never reused ------------------------------------------------------
+
+
+async def test_first_run_seq_is_time_seeded(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok)
+    await hub.async_load_seq()
+    await hub.async_pulse(1, 2)
+
+    assert all(SEQ_MIN <= seq < SEQ_MAX for seq in conn.seqs())
+    assert len(set(conn.seqs())) == len(conn.seqs())
+
+
+async def test_seq_continues_across_a_restart(hass: HomeAssistant) -> None:
+    """The 2026-11-06 failures: after each restart CMD 6 went out with SEQ 2."""
+    entry = make_entry(lockout=0)
+    first, conn1 = make_hub(hass, gate_ok, entry)
+    await first.async_load_seq()
+    await first.async_pulse(1, 2)
+    await first.async_close()  # HA stops; the counter is saved
+    _HUBS.remove(first)
+
+    second, conn2 = make_hub(hass, gate_ok, entry)  # HA starts again
+    await second.async_load_seq()
+    await second.async_pulse(1, 2)
+
+    assert min(conn2.seqs()) > max(conn1.seqs())
+
+
+async def test_seq_wraps_inside_the_range(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok)
+    hub._seq = SEQ_MAX - 1
+    await hub.async_pulse(1, 2)
+
+    assert conn.seqs() == [SEQ_MAX - 1, SEQ_MIN]
+
+
+# ---- events ---------------------------------------------------------------------
 
 
 async def test_access_event_reaches_listeners(hass: HomeAssistant) -> None:

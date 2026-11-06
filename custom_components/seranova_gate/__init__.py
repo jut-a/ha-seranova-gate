@@ -22,6 +22,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 import voluptuous as vol
 
@@ -41,9 +42,10 @@ from .const import (
     DEFAULT_PULSE_SECONDS,
     DOMAIN,
     MAX_OUTPUTS,
+    SEQ_STORAGE_VERSION,
     SERVICE_OPEN,
 )
-from .hub import SeranovaHub, outputs_from_options
+from .hub import SeranovaHub, outputs_from_options, seq_storage_key
 from .session import async_get_session
 
 _LOGGER = logging.getLogger(__name__)
@@ -120,6 +122,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> 
         raise ConfigEntryNotReady(f"SERANOVA login failed: {err}") from err
 
     hub = SeranovaHub(hass, entry, session, web)
+    await hub.async_load_seq()
     entry.runtime_data = hub
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -146,3 +149,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) ->
     if unload_ok:
         await entry.runtime_data.async_close()
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> None:
+    """Delete the stored frame counter with the entry."""
+    await Store(hass, SEQ_STORAGE_VERSION, seq_storage_key(entry.entry_id)).async_remove()

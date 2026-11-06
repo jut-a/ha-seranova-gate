@@ -41,6 +41,7 @@ from .const import (
     CONF_APP_KEY,
     CONF_IMEI,
     CONF_POLL_MINUTES,
+    CONF_PULSE_LOCKOUT,
     CONF_SYSTEM_NAME,
     CONF_USER_CODE,
     DEFAULT_APP_KEY,
@@ -342,7 +343,12 @@ class SeranovaOptionsFlow(OptionsFlow):
                 NumberSelectorConfig(
                     min=0, max=240, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min"
                 )
-            )
+            ),
+            vol.Required(CONF_PULSE_LOCKOUT): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=300, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="s"
+                )
+            ),
         }
         for n in range(1, MAX_OUTPUTS + 1):
             fields[vol.Required(output_key(n, "enabled"))] = BooleanSelector()

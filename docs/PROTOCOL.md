@@ -114,8 +114,23 @@ The web app re-sends a command frame every second (up to 10 extra times) until i
 expected reply — for CMD 6 an ack **and** a CMD 10 frame. A page that is open gets CMD 10
 updates quickly. A client that does not get CMD 10 keeps re-sending, and **the device runs the
 re-sent CMD 6 again**: one button press produced two "Access Gained" events 4 s apart. The
-integration therefore re-sends only CMD 2 and sends CMD 6 exactly once, treating its ack, a
-CMD 10 or the CMD 14 access event as confirmation (10 s timeout).
+integration therefore re-sends only CMD 2 and sends CMD 6 exactly once.
+
+## The cloud's ack is not delivery
+
+`{"ack":{"cmd":6}}` arrives 0.2–0.5 s after the command, far too fast for a round trip to a
+cellular device: it is the **cloud's** acknowledgement. In one test the ack came and the
+device never ran the command (nothing in its event log). Only the device's own CMD 14 event
+with Contact ID 422 ("Access Gained") proves the output switched; CMD 10 frames are no proof
+either, they also arrive whenever an app polls the device.
+
+## Never reuse a SEQ
+
+Observed with a client whose SEQ restarted at 0 on every start (so CMD 6 always went out with
+the same small SEQ): one press ran **three** times (2 s apart), the next one **not at all**
+although the cloud acked it — while presses with fresh SEQ values ran once. The web app starts
+at 0 per page load too, but polls constantly, so its SEQ at the moment of a press is large and
+different every time. Keep a counter that is stored across restarts and never repeats.
 
 ## SMS control (from the manual)
 
