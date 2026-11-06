@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+# Never commit downloaded diagnostics or captures: they can hold IMEI, ICCID, codes.
+*diagnostics*.json
+captures/

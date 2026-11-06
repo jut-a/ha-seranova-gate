@@ -1,0 +1,140 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sign in to SERANOVA",
+        "description": "Use the e-mail and password of your SERANOVA app account. Accounts that sign in with Google or Apple, or that use two-factor authentication, are not supported.",
+        "data": {
+          "email": "E-mail",
+          "password": "Password"
+        }
+      },
+      "pick": {
+        "title": "Choose the system",
+        "data": {
+          "system": "System"
+        }
+      },
+      "codes": {
+        "title": "Device access codes",
+        "description": "IMEI: {imei}\n\nApp Key = the device's SERA Cloud Service key (default 123456). User code = your code in the device's user table, the one the SERANOVA app uses. The codes are checked against the device; if the device is asleep the entry is created anyway.",
+        "data": {
+          "imei": "IMEI (UID)",
+          "app_key": "App Key",
+          "user_code": "User code",
+          "system_name": "Name"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Sign in again",
+        "description": "The SERANOVA cloud rejected the stored login for {email}.",
+        "data": {
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Login and access codes",
+        "description": "IMEI: {imei}\n\nLeave the password or user code empty to keep the current one.",
+        "data": {
+          "email": "E-mail",
+          "password": "Password",
+          "app_key": "App Key",
+          "user_code": "User code",
+          "system_name": "Name"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Wrong e-mail or password.",
+      "two_factor": "This account uses two-factor authentication, which the integration cannot complete.",
+      "captcha": "The server asked for a captcha. Sign in once on seranova.eu, then try again.",
+      "cannot_connect": "Could not reach the SERANOVA cloud.",
+      "invalid_imei": "The IMEI must be 15 digits.",
+      "invalid_app_key": "The device rejected this App Key.",
+      "invalid_user_code": "The device rejected this user code.",
+      "unknown_uid": "The cloud does not know this IMEI.",
+      "unknown": "Unexpected error, see the log."
+    },
+    "abort": {
+      "already_configured": "This system is already set up.",
+      "reauth_successful": "Login updated.",
+      "reconfigure_successful": "Settings updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Outputs and status polling",
+        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off.",
+        "data": {
+          "poll_minutes": "Status poll interval",
+          "out1_enabled": "Output 1 enabled",
+          "out1_name": "Output 1 name",
+          "out1_seconds": "Output 1 pulse length",
+          "out2_enabled": "Output 2 enabled",
+          "out2_name": "Output 2 name",
+          "out2_seconds": "Output 2 pulse length",
+          "out3_enabled": "Output 3 enabled",
+          "out3_name": "Output 3 name",
+          "out3_seconds": "Output 3 pulse length",
+          "out4_enabled": "Output 4 enabled",
+          "out4_name": "Output 4 name",
+          "out4_seconds": "Output 4 pulse length"
+        }
+      }
+    },
+    "error": {
+      "no_outputs": "Enable at least one output."
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      }
+    },
+    "sensor": {
+      "last_event": {
+        "name": "Last event"
+      }
+    },
+    "event": {
+      "device_event": {
+        "name": "Event",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "access_granted": "Access granted",
+              "access_denied": "Access denied",
+              "alarm": "Alarm",
+              "trouble": "Trouble",
+              "restore": "Restore",
+              "test": "Test",
+              "event": "Event"
+            }
+          }
+        }
+      }
+    }
+  },
+  "services": {
+    "open": {
+      "name": "Pulse output",
+      "description": "Pulses a PROGATE output through the SERANOVA cloud, the same way the app does. With a response variable it returns success, stage, error and fallback_safe (true only when the output command was never delivered, so an SMS fallback cannot cause a second pulse).",
+      "fields": {
+        "config_entry_id": {
+          "name": "System",
+          "description": "Only needed when more than one system is set up."
+        },
+        "output": {
+          "name": "Output",
+          "description": "Logical output 1-4."
+        },
+        "seconds": {
+          "name": "Seconds",
+          "description": "Pulse length; defaults to the output's configured length."
+        }
+      }
+    }
+  }
+}

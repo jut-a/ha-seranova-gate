@@ -1,0 +1,27 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "online": {
+        "default": "mdi:cloud-check-outline",
+        "state": {
+          "off": "mdi:cloud-off-outline"
+        }
+      }
+    },
+    "sensor": {
+      "last_event": {
+        "default": "mdi:message-text-clock-outline"
+      }
+    },
+    "event": {
+      "device_event": {
+        "default": "mdi:gate-alert"
+      }
+    }
+  },
+  "services": {
+    "open": {
+      "service": "mdi:gate-open"
+    }
+  }
+}

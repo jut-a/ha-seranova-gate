@@ -1,0 +1,23 @@
+open:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: seranova_gate
+    output:
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 4
+          mode: box
+    seconds:
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 600
+          mode: box
+          unit_of_measurement: s

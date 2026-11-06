@@ -1,0 +1,13 @@
+{
+  "domain": "seranova_gate",
+  "name": "Seranova Gate (Topkodas PROGATE)",
+  "codeowners": ["@jut-a"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/jut-a/ha-seranova-gate",
+  "integration_type": "device",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/jut-a/ha-seranova-gate/issues",
+  "requirements": [],
+  "version": "0.2.0"
+}
