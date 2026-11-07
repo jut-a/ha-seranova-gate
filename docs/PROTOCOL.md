@@ -49,6 +49,12 @@ C: 42["message",{…frame…}]
 S: 42["message","<one or more JSON objects back to back>"]
 ```
 
+While the device is not connected to the cloud, the server answers a command for it with
+`{"ERROR":3}` and then closes the client's session within 0.1–0.3 s — every session, for as
+long as the device stays away. A client that reconnects at a fixed short interval hammers the
+server; the integration backs off exponentially (2 s → 300 s) for sessions shorter than 30 s
+and, after three of them, goes back to Home Assistant's "Retrying setup".
+
 A websocket that does not send the `40` connect within 45 s is closed by the server
 (socket.io's default `connectTimeout`). Expect server-initiated closes (`41` / `1`) of
 authenticated sessions too — for a while they came every ~100 s, cause unknown — and

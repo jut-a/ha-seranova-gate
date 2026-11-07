@@ -18,6 +18,9 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
   you learn something new. `docs/SMS.md` — the PROGATE's SMS commands, summarised from the
   manual (V-2026-10-15, section 10). `docs/progate.png` — the README picture (Topkodas product
   photo, credited).
+- Storage (`.storage/`): `seranova_gate.<entry_id>.seq` (frame counter, deleted with the entry)
+  and `seranova_gate.<IMEI>.events` (the event audit log; per device, kept when the entry is
+  removed, trimmed only by the `event_log_days` option).
 - `hacs.json`, `.github/workflows/validate.yaml` (hassfest + HACS action, brands ignored).
 
 ## Hard rules
@@ -73,10 +76,14 @@ Live: there is no simulator; test against a real device while someone watches th
 
 1. Bump `version` in `custom_components/seranova_gate/manifest.json` (semver; 0.x until the
    integration has been tested in the field — first public version 0.2.0).
-2. Commit, tag **exactly the manifest version** (e.g. `0.2.1`, no `v` prefix — the Home Assistant
-   Marketplace expects the tag and `version` to match), push, and publish a GitHub release with
-   notes; the Marketplace / HACS offer releases as updates.
-3. The Validate workflow must be green (hassfest + HACS).
+2. Add the version's entry to `CHANGELOG.md` (Added / Changed / Fixed / Documentation).
+3. `main` takes changes only through a PR (squash-merge, required checks). Commit messages carry
+   **no `Co-Authored-By` trailer** (it lists the tool as a contributor on GitHub). Tag the merge
+   commit with **exactly the manifest version** (e.g. `0.2.1`, no `v` prefix — the Home
+   Assistant Marketplace expects the tag and `version` to match) and publish a full (not
+   pre-) GitHub release with the changelog entry as notes; the Marketplace / HACS offer
+   releases as updates.
+4. The Validate workflow must be green (hassfest + HACS).
 
 ## Home Assistant Marketplace (HA 2026.11+, replaced HACS)
 

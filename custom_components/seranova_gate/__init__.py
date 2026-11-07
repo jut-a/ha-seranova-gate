@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -24,6 +24,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt as dt_util
 import voluptuous as vol
 
 from .api import (
@@ -35,23 +36,40 @@ from .api import (
 )
 from .const import (
     ATTR_CONFIG_ENTRY_ID,
+    ATTR_EVENT_TYPE,
+    ATTR_LIMIT,
     ATTR_OUTPUT,
     ATTR_SECONDS,
+    ATTR_SINCE,
+    ATTR_UNTIL,
     CONF_POLL_MINUTES,
+    DEFAULT_EVENTS_LIMIT,
     DEFAULT_POLL_MINUTES,
     DEFAULT_PULSE_SECONDS,
     DOMAIN,
+    EVENT_TYPES,
+    MAX_EVENTS_LIMIT,
     MAX_OUTPUTS,
     SEQ_STORAGE_VERSION,
+    SERVICE_GET_EVENTS,
     SERVICE_OPEN,
 )
-from .hub import SeranovaHub, outputs_from_options, seq_storage_key
+from .hub import (
+    DeviceUnavailable,
+    LoginRejected,
+    SeranovaHub,
+    outputs_from_options,
+    seq_storage_key,
+)
 from .session import async_get_session
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.EVENT, Platform.SENSOR]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+# Setup waits this long for the gate controller to answer a state request.
+SETUP_READY_TIMEOUT = 45
 
 type SeranovaConfigEntry = ConfigEntry[SeranovaHub]
 
@@ -66,24 +84,49 @@ OPEN_SCHEMA = vol.Schema(
 )
 
 
+GET_EVENTS_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_SINCE): cv.datetime,
+        vol.Optional(ATTR_UNTIL): cv.datetime,
+        vol.Optional(ATTR_EVENT_TYPE): vol.In(EVENT_TYPES),
+        vol.Optional(ATTR_LIMIT, default=DEFAULT_EVENTS_LIMIT): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=MAX_EVENTS_LIMIT)
+        ),
+    }
+)
+
+
+def _loaded_entry(hass: HomeAssistant, call: ServiceCall) -> SeranovaConfigEntry:
+    """The one loaded entry the call is for."""
+    loaded = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED
+    ]
+    if entry_id := call.data.get(ATTR_CONFIG_ENTRY_ID):
+        loaded = [entry for entry in loaded if entry.entry_id == entry_id]
+    if not loaded:
+        raise ServiceValidationError("No loaded Seranova Gate entry")
+    if len(loaded) > 1:
+        raise ServiceValidationError("Several Seranova systems are set up; pass config_entry_id")
+    return loaded[0]
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """A datetime from the action; one without a time zone is local time."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt_util.get_default_time_zone())
+    return dt_util.as_utc(value)
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register the seranova_gate.open action."""
+    """Register the seranova_gate.open and seranova_gate.get_events actions."""
 
     async def _async_open(call: ServiceCall) -> ServiceResponse:
-        loaded = [
-            entry
-            for entry in hass.config_entries.async_entries(DOMAIN)
-            if entry.state is ConfigEntryState.LOADED
-        ]
-        if entry_id := call.data.get(ATTR_CONFIG_ENTRY_ID):
-            loaded = [entry for entry in loaded if entry.entry_id == entry_id]
-        if not loaded:
-            raise ServiceValidationError("No loaded Seranova Gate entry")
-        if len(loaded) > 1:
-            raise ServiceValidationError(
-                "Several Seranova systems are set up; pass config_entry_id"
-            )
-        entry: SeranovaConfigEntry = loaded[0]
+        entry = _loaded_entry(hass, call)
         output = call.data[ATTR_OUTPUT]
         seconds = call.data.get(ATTR_SECONDS)
         if seconds is None:
@@ -105,6 +148,24 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         schema=OPEN_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
+
+    async def _async_get_events(call: ServiceCall) -> ServiceResponse:
+        hub = _loaded_entry(hass, call).runtime_data
+        events = hub.get_events(
+            since=_as_utc(call.data.get(ATTR_SINCE)),
+            until=_as_utc(call.data.get(ATTR_UNTIL)),
+            event_type=call.data.get(ATTR_EVENT_TYPE),
+            limit=call.data[ATTR_LIMIT],
+        )
+        return {"events": events, "count": len(events), "logged": len(hub.event_log)}
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_GET_EVENTS,
+        _async_get_events,
+        schema=GET_EVENTS_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
     return True
 
 
@@ -123,24 +184,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> 
 
     hub = SeranovaHub(hass, entry, session, web)
     await hub.async_load_seq()
-    entry.runtime_data = hub
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
+    await hub.async_load_event_log()
     entry.async_create_background_task(
         hass, hub.async_run(), f"{DOMAIN} cloud connection {hub.imei[-4:]}"
     )
+    # Only a gate controller that answers a state request counts as set up; until
+    # then Home Assistant shows "Retrying setup" with the reason and retries itself.
+    try:
+        await hub.async_wait_ready(SETUP_READY_TIMEOUT)
+    except LoginRejected as err:
+        await hub.async_close()
+        raise ConfigEntryAuthFailed(str(err)) from err
+    except DeviceUnavailable as err:
+        await hub.async_close()
+        raise ConfigEntryNotReady(str(err)) from err
+    entry.runtime_data = hub
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     poll_minutes = int(entry.options.get(CONF_POLL_MINUTES, DEFAULT_POLL_MINUTES))
     if poll_minutes > 0:
         entry.async_on_unload(
             async_track_time_interval(hass, hub.async_poll, timedelta(minutes=poll_minutes))
         )
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
-
-
-async def _async_update_listener(hass: HomeAssistant, entry: SeranovaConfigEntry) -> None:
-    """Reload when the options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> bool:

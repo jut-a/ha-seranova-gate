@@ -22,6 +22,7 @@ CONF_USER_CODE: Final = "user_code"
 CONF_SYSTEM_NAME: Final = "system_name"
 CONF_POLL_MINUTES: Final = "poll_minutes"
 CONF_PULSE_LOCKOUT: Final = "pulse_lockout"
+CONF_EVENT_LOG_DAYS: Final = "event_log_days"
 
 DEFAULT_APP_KEY: Final = "123456"
 DEFAULT_POLL_MINUTES: Final = 10
@@ -35,6 +36,8 @@ DEFAULT_PULSE_LOCKOUT: Final = 30
 # event (a double tap, a queued call) still waits the full minimum time.
 CONFIRMED_PULSE_GUARD: Final = 5
 MAX_OUTPUTS: Final = 4
+# Days the event audit log keeps; 0 keeps every event forever.
+DEFAULT_EVENT_LOG_DAYS: Final = 0
 
 # Frame CMD numbers (MSG.CMD when sending, CMD when receiving).
 CMD_INFO: Final = 1  # request / reply: system info (VAL)
@@ -82,8 +85,14 @@ SEQ_MAX: Final = 60000
 SEQ_RESTART_GAP: Final = 100  # skip values a crash may have used before saving
 SEQ_SAVE_DELAY: Final = 10
 
-# Reconnect this soon after a working session ends; failed attempts back off to 300 s.
+# Reconnect this soon after a working session ends. Failed connects, and sessions the
+# server closes within SHORT_SESSION_SECONDS, back off exponentially up to RECONNECT_MAX:
+# with the device offline the cloud closed every session within 0.3 s, and a fixed
+# 2 s retry opened 300+ sessions in 13 minutes. A command that needs the connection
+# cuts the wait short.
 RECONNECT_MIN: Final = 2
+RECONNECT_MAX: Final = 300
+SHORT_SESSION_SECONDS: Final = 30
 # The Online sensor keeps its state this long while the socket reconnects.
 CLOUD_GRACE_SECONDS: Final = 60
 
@@ -98,10 +107,22 @@ EVENT_TYPES: Final = [
     "event",
 ]
 
+# Event audit log: every device event, kept in HA storage (outside the recorder, so
+# never purged) under the device's IMEI, so it survives removing and re-adding the entry.
+EVENT_LOG_STORAGE_VERSION: Final = 1
+EVENT_LOG_SAVE_DELAY: Final = 2
+
 SERVICE_OPEN: Final = "open"
+SERVICE_GET_EVENTS: Final = "get_events"
 ATTR_CONFIG_ENTRY_ID: Final = "config_entry_id"
 ATTR_OUTPUT: Final = "output"
 ATTR_SECONDS: Final = "seconds"
+ATTR_SINCE: Final = "since"
+ATTR_UNTIL: Final = "until"
+ATTR_EVENT_TYPE: Final = "event_type"
+ATTR_LIMIT: Final = "limit"
+DEFAULT_EVENTS_LIMIT: Final = 100
+MAX_EVENTS_LIMIT: Final = 10000
 
 
 def output_key(number: int, field: str) -> str:
@@ -112,6 +133,7 @@ def output_key(number: int, field: str) -> str:
 DEFAULT_OPTIONS: Final[dict] = {
     CONF_POLL_MINUTES: DEFAULT_POLL_MINUTES,
     CONF_PULSE_LOCKOUT: DEFAULT_PULSE_LOCKOUT,
+    CONF_EVENT_LOG_DAYS: DEFAULT_EVENT_LOG_DAYS,
     **{
         key: value
         for n in range(1, MAX_OUTPUTS + 1)

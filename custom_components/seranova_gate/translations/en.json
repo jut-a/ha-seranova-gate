@@ -65,10 +65,11 @@
     "step": {
       "init": {
         "title": "Outputs and status polling",
-        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off. The minimum time between pulses refuses a new pulse that soon after the last one or after any access the device reported: on an open/stop/close gate a second pulse stops or reverses it (0 turns the protection off). Once the device has confirmed a pulse, a new press made after that is allowed 5 s later, so the gate can still be stopped or closed.",
+        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off. The minimum time between pulses refuses a new pulse that soon after the last one or after any access the device reported: on an open/stop/close gate a second pulse stops or reverses it (0 turns the protection off). Once the device has confirmed a pulse, a new press made after that is allowed 5 s later, so the gate can still be stopped or closed. The event log keeps every device event (time, type, user or zone, text) outside the recorder, so it is not purged; read it with the seranova_gate.get_events action. It keeps events for the given number of days; 0 keeps them forever.",
         "data": {
           "poll_minutes": "Status poll interval",
           "pulse_lockout": "Minimum time between pulses",
+          "event_log_days": "Keep events in the event log (days)",
           "out1_enabled": "Output 1 enabled",
           "out1_name": "Output 1 name",
           "out1_seconds": "Output 1 pulse length",
@@ -97,6 +98,9 @@
     "sensor": {
       "last_event": {
         "name": "Last event"
+      },
+      "last_event_time": {
+        "name": "Last event time"
       }
     },
     "event": {
@@ -135,6 +139,45 @@
           "name": "Seconds",
           "description": "Pulse length; defaults to the output's configured length."
         }
+      }
+    },
+    "get_events": {
+      "name": "Get logged events",
+      "description": "Returns events from the gate controller's event log, newest first. The log is kept outside the recorder and is not purged (see the integration's options for how long it keeps events). Events the device sent while Home Assistant was not connected are missing; the SERANOVA event log is the complete record.",
+      "fields": {
+        "config_entry_id": {
+          "name": "System",
+          "description": "Only needed when more than one system is set up."
+        },
+        "since": {
+          "name": "Since",
+          "description": "Only events at or after this time."
+        },
+        "until": {
+          "name": "Until",
+          "description": "Only events at or before this time."
+        },
+        "event_type": {
+          "name": "Event type",
+          "description": "Only events of this type."
+        },
+        "limit": {
+          "name": "Limit",
+          "description": "At most this many events (newest first)."
+        }
+      }
+    }
+  },
+  "selector": {
+    "event_type": {
+      "options": {
+        "access_granted": "Access granted",
+        "access_denied": "Access denied",
+        "alarm": "Alarm",
+        "trouble": "Trouble",
+        "restore": "Restore",
+        "test": "Test",
+        "event": "Event"
       }
     }
   }

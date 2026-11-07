@@ -21,3 +21,40 @@ open:
           max: 600
           mode: box
           unit_of_measurement: s
+
+get_events:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: seranova_gate
+    since:
+      required: false
+      selector:
+        datetime:
+    until:
+      required: false
+      selector:
+        datetime:
+    event_type:
+      required: false
+      selector:
+        select:
+          options:
+            - access_granted
+            - access_denied
+            - alarm
+            - trouble
+            - restore
+            - test
+            - event
+          translation_key: event_type
+    limit:
+      required: false
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 10000
+          mode: box
