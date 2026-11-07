@@ -15,18 +15,26 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
   - `button.py`, `binary_sensor.py`, `event.py`, `entity.py`, `diagnostics.py`.
   - `translations/en.json` is the only strings file (custom integrations don't use strings.json).
 - `docs/PROTOCOL.md` — everything known about the cloud and device protocol. Update it when
-  you learn something new.
+  you learn something new. `docs/SMS.md` — the PROGATE's SMS commands, summarised from the
+  manual (V-2026-10-15, section 10). `docs/progate.png` — the README picture (Topkodas product
+  photo, credited).
 - `hacs.json`, `.github/workflows/validate.yaml` (hassfest + HACS action, brands ignored).
 
 ## Hard rules
 
 1. **Never re-send CMD 6 (or CMD 5).** The device does not de-duplicate a re-sent frame with
-   the same SEQ; a retry pulses the output again, which stops or reverses a gate. CMD 2
-   ("prepare", no CODE) is the only command that may be retried. If you change the command
+   the same SEQ; a retry pulses the output again, which stops or reverses a gate. Only CMD 10
+   (the state request, a read) and CMD 2 ("prepare", no CODE) may be retried. **Nothing that can
+   switch an output is sent before the device itself has answered a CMD 10 state request** (a
+   CMD 10 frame with a fresh device `TIME`; the cloud's ack and CMD 1 replies prove nothing) —
+   without this wake most CMD 6 were acked by the cloud and lost. If you change the command
    path, keep `CommandResult.fallback_safe` meaning "the output command was never delivered".
    Also: success only on the device's CMD 14 access event (the cloud ack is not delivery),
    never reuse a SEQ (the counter is stored per entry and survives restarts), and keep the
-   minimum time between pulses — open/stop/close gate inputs are common.
+   minimum time between pulses — open/stop/close gate inputs are common. Its one exception: a
+   press made after the device's access event confirmed our pulse may go 5 s after that event
+   (`CONFIRMED_PULSE_GUARD`); double taps, unconfirmed pulses and other access events keep the
+   full time.
 2. **No personal data in the repo**: no IMEI, ICCID, App Key, user codes, phone numbers,
    e-mail addresses, real names or captured diagnostics — in code, tests, docs, commits or
    issue text. Use placeholders (`864000000000000`, `John`).

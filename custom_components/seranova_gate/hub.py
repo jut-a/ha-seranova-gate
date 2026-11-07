@@ -38,11 +38,13 @@ from .const import (
     CMD_INFO,
     CMD_OUTPUT_PULSE,
     CMD_PREPARE,
+    CMD_SYSTEM,
     CONF_APP_KEY,
     CONF_IMEI,
     CONF_PULSE_LOCKOUT,
     CONF_SYSTEM_NAME,
     CONF_USER_CODE,
+    CONFIRMED_PULSE_GUARD,
     DEFAULT_PULSE_LOCKOUT,
     DEFAULT_PULSE_SECONDS,
     DOMAIN,
@@ -61,6 +63,9 @@ from .const import (
     SEQ_RESTART_GAP,
     SEQ_SAVE_DELAY,
     SEQ_STORAGE_VERSION,
+    STATE_MAX_AGE,
+    WAKE_INTERVAL,
+    WAKE_RETRIES,
     WEB_BASE,
     output_key,
 )
@@ -136,6 +141,44 @@ def pulse_confirmation(frame: dict[str, Any]) -> str | None:
     if isinstance(event, dict) and parse_event(event)[0] == "access_granted":
         return "access_event"
     return None
+
+
+def state_age(frame: dict[str, Any], now: float) -> float | None:
+    """Seconds since the device stamped a CMD 10 frame (None: not CMD 10 or no TIME)."""
+    if as_int(frame.get("CMD")) != CMD_SYSTEM:
+        return None
+    stamp = as_int(frame.get("TIME"))
+    return None if stamp is None else now - stamp
+
+
+def is_fresh_state(frame: dict[str, Any], now: float) -> bool:
+    """A CMD 10 frame the device stamped within STATE_MAX_AGE (either way)."""
+    age = state_age(frame, now)
+    return age is not None and abs(age) <= STATE_MAX_AGE
+
+
+class StateCheck:
+    """Confirms a CMD 10 request: only the device's own, freshly stamped state frame.
+
+    The cloud acks the request at once and may hand out a stored copy, so neither
+    the ack nor an old frame proves the device answered.
+    """
+
+    def __init__(self) -> None:
+        """Nothing seen yet."""
+        self.stale = 0
+        self.lag: float | None = None
+
+    def __call__(self, frame: dict[str, Any]) -> str | None:
+        """Label for a fresh state frame, else None."""
+        age = state_age(frame, time.time())
+        if age is None:
+            return None
+        if abs(age) > STATE_MAX_AGE:
+            self.stale += 1
+            return None
+        self.lag = round(age, 1)
+        return "device_state"
 
 
 @dataclass(slots=True)
@@ -263,6 +306,8 @@ class SeranovaHub:
         )
         self._lockout = int(entry.options.get(CONF_PULSE_LOCKOUT, DEFAULT_PULSE_LOCKOUT))
         self._last_pulse_at: float | None = None
+        # When the device's access event confirmed that pulse (None: not confirmed).
+        self._confirmed_at: float | None = None
         self._last_access_at: float | None = None
         self._cmd_lock = asyncio.Lock()
         self._waiters: set[_Waiter] = set()
@@ -278,6 +323,8 @@ class SeranovaHub:
         self.recent_sessions: deque[dict[str, Any]] = deque(maxlen=20)
         self.recent_commands: deque[dict[str, Any]] = deque(maxlen=20)
         self.recent_events: deque[dict[str, Any]] = deque(maxlen=20)
+        self.recent_state_checks: deque[dict[str, Any]] = deque(maxlen=20)
+        self._device_checked = False
         self.stats: dict[str, int] = dict.fromkeys(
             (
                 "pulses_requested",
@@ -285,6 +332,8 @@ class SeranovaHub:
                 "pulses_unconfirmed",
                 "pulses_refused",
                 "pulses_not_sent",
+                "state_checks",
+                "state_checks_unanswered",
                 "events_received",
                 "sessions_ended",
                 "connect_failures",
@@ -430,7 +479,7 @@ class SeranovaHub:
         )
         self._notify()
         self.entry.async_create_background_task(
-            self.hass, self.async_poll(), f"{DOMAIN} poll after connect"
+            self.hass, self._async_after_connect(), f"{DOMAIN} after connect"
         )
         try:
             await conn.run()
@@ -500,13 +549,18 @@ class SeranovaHub:
                 changed = True
 
             if cmd is not None and error != ERR_DEVICE_OFFLINE:
-                self.last_seen = dt_util.utcnow()
-                self.device_online = True
                 changed = True
                 if cmd == CMD_INFO:
+                    # Answered within seconds even while the device runs no commands:
+                    # most likely the cloud's copy of the device's connect message, so
+                    # it does not prove the device is reachable.
                     self.sysinfo = frame.get("VAL")
-                elif cmd == CMD_EVENT:
-                    self._dispatch_event(frame)
+                elif cmd != CMD_SYSTEM or is_fresh_state(frame, time.time()):
+                    # A device frame: an event, or state stamped by the device's clock.
+                    self.last_seen = dt_util.utcnow()
+                    self.device_online = True
+                    if cmd == CMD_EVENT:
+                        self._dispatch_event(frame)
 
             for waiter in list(self._waiters):
                 waiter.feed(frame)
@@ -559,14 +613,31 @@ class SeranovaHub:
         self._seq_store.async_delay_save(self._seq_data, SEQ_SAVE_DELAY)
         return seq
 
-    def _lockout_remaining(self) -> float:
-        """Seconds until another pulse is allowed (0 = allowed)."""
+    def _lockout_remaining(self, requested_at: float) -> float:
+        """Seconds until a pulse requested at `requested_at` is allowed (0 = allowed).
+
+        The minimum time runs from our last pulse and from any access event, with one
+        exception: once the device confirmed our pulse with its access event, a press
+        made after that event waits only CONFIRMED_PULSE_GUARD seconds from it. A
+        press made before it (a double tap, a queued call) waits the full time, and
+        any other access event (another user, or the device repeating a command)
+        restarts the full time, because the two cannot be told apart.
+        """
         if self._lockout <= 0:
             return 0
-        recent = [t for t in (self._last_pulse_at, self._last_access_at) if t is not None]
-        if not recent:
-            return 0
-        return max(0.0, self._lockout - (time.monotonic() - max(recent)))
+        now = time.monotonic()
+        waits = [0.0]
+        confirmed = self._confirmed_at
+        if self._last_pulse_at is not None:
+            if confirmed is not None and requested_at > confirmed:
+                guard = min(CONFIRMED_PULSE_GUARD, self._lockout)
+                waits.append(guard - (now - confirmed))
+            else:
+                waits.append(self._lockout - (now - self._last_pulse_at))
+        access = self._last_access_at
+        if access is not None and (confirmed is None or access > confirmed):
+            waits.append(self._lockout - (now - access))
+        return max(waits)
 
     async def _ensure_connected(self, timeout: float = 15) -> SocketIoConnection:
         if self._conn is None or not self._conn.connected:
@@ -622,8 +693,10 @@ class SeranovaHub:
             waiter.discard()
 
     async def async_pulse(self, output: int, seconds: int) -> CommandResult:
-        """Pulse an output: CMD 2 (re-sent until acked), then CMD 6 sent once.
+        """Pulse an output: wake (CMD 10 until the device answers), CMD 2, CMD 6 once.
 
+        CMD 10 and CMD 2 may be re-sent; CMD 6 never is. Nothing that can switch an
+        output is sent before the device itself has answered the state request.
         Success needs the device's own access event; a pulse within the lockout
         of the previous one (or of any access the device reported) is refused.
         Every attempt is recorded for the diagnostics.
@@ -632,7 +705,7 @@ class SeranovaHub:
         started = time.monotonic()
         started_wall = dt_util.utcnow()
         trace: dict[str, _Waiter] = {}
-        result = await self._pulse(output, seconds, trace)
+        result = await self._pulse(output, seconds, trace, started)
         self._record_pulse(output, seconds, result, trace, started, started_wall)
         return result
 
@@ -649,7 +722,8 @@ class SeranovaHub:
         def after(mark: float | None) -> float | None:
             return None if mark is None else round(mark - started, 2)
 
-        prepare, pulse = trace.get("prepare"), trace.get("pulse")
+        wake, prepare, pulse = trace.get("wake"), trace.get("prepare"), trace.get("pulse")
+        check = wake.confirm if wake and isinstance(wake.confirm, StateCheck) else None
         entry = {
             "time": started_wall.isoformat(),
             "output": output,
@@ -659,6 +733,10 @@ class SeranovaHub:
             "fallback_safe": result.fallback_safe,
             "confirmed_by": result.confirmed_by,
             "error": result.error,
+            "wake_sends": wake.attempts if wake else 0,
+            "wake_answered_after_s": after(wake.done_at) if wake else None,
+            "device_lag_s": check.lag if check else None,
+            "stale_state_replies": check.stale if check else 0,
             "prepare_sends": prepare.attempts if prepare else 0,
             "prepare_acked_after_s": after(prepare.done_at) if prepare else None,
             "pulse_seq": pulse.seq if pulse and pulse.sent else None,
@@ -678,9 +756,11 @@ class SeranovaHub:
             self.stats["pulses_unconfirmed"] += 1
         _LOGGER.debug("Pulse result: %s", entry)
 
-    async def _pulse(self, output: int, seconds: int, trace: dict[str, _Waiter]) -> CommandResult:
+    async def _pulse(
+        self, output: int, seconds: int, trace: dict[str, _Waiter], requested_at: float
+    ) -> CommandResult:
         async with self._cmd_lock:
-            if (wait := self._lockout_remaining()) > 0:
+            if (wait := self._lockout_remaining(requested_at)) > 0:
                 return CommandResult(
                     False,
                     "locked",
@@ -691,26 +771,34 @@ class SeranovaHub:
             except SeranovaError as err:
                 return CommandResult(False, "connect", str(err), fallback_safe=True)
 
+            # Wake: the device's own answer to a state request (CMD 10) before anything
+            # that can switch an output, as an open web page has before its button is
+            # pressed. Without it the cloud acks CMD 6 but the device often never gets it.
+            trace["wake"] = _Waiter(None, confirm=StateCheck())
+            try:
+                await self._check_device(trace["wake"], "pulse")
+            except SeranovaError as err:
+                return CommandResult(False, "wake", str(err), fallback_safe=True)
+
+            # CMD 2 is answered by the cloud itself (in well under a second), so a
+            # failure here is the cloud not responding: stage "connect".
             trace["prepare"] = _Waiter(CMD_PREPARE)
             try:
                 await self._send(CMD_PREPARE, None, None, trace["prepare"])
             except DeviceRefused as err:
-                return CommandResult(False, "wake", str(err), fallback_safe=True)
+                return CommandResult(False, "connect", str(err), fallback_safe=True)
             except CommandTimeout:
-                reason = (
-                    "device offline"
-                    if self.device_online is False
-                    else "device did not answer"
+                return CommandResult(
+                    False, "connect", "the cloud did not acknowledge CMD 2", fallback_safe=True
                 )
-                return CommandResult(False, "wake", reason, fallback_safe=True)
             except SeranovaError as err:
-                return CommandResult(False, "wake", str(err), fallback_safe=True)
+                return CommandResult(False, "connect", str(err), fallback_safe=True)
 
             # CMD 6 is sent ONCE. The device does not de-duplicate a re-sent frame
             # with the same SEQ: in testing, re-sending every second (waiting for a
             # CMD 10 that never came) opened the gate twice, 4 s apart. The web app
-            # re-sends too but gets CMD 10 quickly because its page subscribes to
-            # state. Success needs the device's access event, not the cloud's ack.
+            # re-sends too but gets CMD 10 quickly because its open page has already
+            # woken the device. Success needs the device's access event, not the ack.
             waiter = trace["pulse"] = _Waiter(CMD_OUTPUT_PULSE, confirm=pulse_confirmation)
             try:
                 await self._send(
@@ -744,12 +832,90 @@ class SeranovaHub:
             finally:
                 if waiter.sent:
                     self._last_pulse_at = time.monotonic()
+                    self._confirmed_at = None
+            # The access event that confirmed it (_last_access_at was set by the same
+            # frame just before, so it is not counted as a separate access).
+            self._confirmed_at = waiter.done_at
             return CommandResult(
                 True, "open", acked=waiter.acked, confirmed_by=waiter.confirmed_by
             )
 
+    async def _check_device(self, waiter: _Waiter, reason: str) -> None:
+        """Ask the device for its state (CMD 10) until it answers with a fresh frame.
+
+        The caller holds the command lock; waiter.confirm must be a StateCheck.
+        Re-sent every WAKE_INTERVAL s (a read, safe to repeat). Raises CommandTimeout
+        when no fresh answer comes, DeviceRefused on ERROR 2/4/5, other SeranovaErrors
+        on socket trouble. Every check is recorded for the diagnostics.
+        """
+        started = time.monotonic()
+        started_wall = dt_util.utcnow()
+        try:
+            await self._send(
+                CMD_SYSTEM,
+                "",
+                self._user_code,
+                waiter,
+                retries=WAKE_RETRIES,
+                interval=WAKE_INTERVAL,
+            )
+        except CommandTimeout as err:
+            self.device_online = False
+            self._notify()
+            check = waiter.confirm
+            stale = check.stale if isinstance(check, StateCheck) else 0
+            detail = f" (only {stale} out-of-date state replies)" if stale else ""
+            raise CommandTimeout(
+                "the gate controller did not answer a state request in "
+                f"{time.monotonic() - started:.0f} s{detail}; nothing was sent to the gate"
+            ) from err
+        finally:
+            self._record_state_check(reason, waiter, started, started_wall)
+
+    @callback
+    def _record_state_check(
+        self, reason: str, waiter: _Waiter, started: float, started_wall: datetime
+    ) -> None:
+        check = waiter.confirm if isinstance(waiter.confirm, StateCheck) else None
+        answered = waiter.done_at is not None
+        entry = {
+            "time": started_wall.isoformat(),
+            "reason": reason,
+            "answered": answered,
+            "sends": waiter.attempts,
+            "answered_after_s": round(waiter.done_at - started, 2) if answered else None,
+            "device_lag_s": check.lag if check else None,
+            "stale_replies": check.stale if check else 0,
+        }
+        self.recent_state_checks.append(entry)
+        self.stats["state_checks"] += 1
+        if not answered:
+            self.stats["state_checks_unanswered"] += 1
+        self._device_checked = True
+        _LOGGER.debug("State check: %s", entry)
+
     async def async_poll(self, _now: datetime | None = None) -> None:
-        """Ask the device for its info so the Online sensor stays current."""
+        """Ask the device itself for its state, so the Online sensor tells the truth."""
+        if self._cmd_lock.locked() or self._conn is None:
+            return
+        async with self._cmd_lock:
+            try:
+                await self._check_device(_Waiter(None, confirm=StateCheck()), "poll")
+            except DeviceRefused as err:
+                self.last_error = str(err)
+            except SeranovaError:
+                pass  # recorded; a timeout has already marked the device offline
+            finally:
+                with contextlib.suppress(Exception):
+                    self._notify()
+
+    async def _async_after_connect(self) -> None:
+        """Open each session with CMD 1 as before, then check the device once per run.
+
+        The CMD 1 reply (probably from the cloud) keeps the system info for the
+        diagnostics. It is sent on every reconnect, as earlier versions did, because
+        pushed events have always arrived on such sessions.
+        """
         if self._cmd_lock.locked() or self._conn is None:
             return
         async with self._cmd_lock:
@@ -759,10 +925,9 @@ class SeranovaHub:
                 )
             except DeviceRefused as err:
                 self.last_error = str(err)
-            except CommandTimeout:
-                self.device_online = False
+                self._notify()
+                return
             except SeranovaError:
                 return
-            finally:
-                with contextlib.suppress(Exception):
-                    self._notify()
+        if not self._device_checked:
+            await self.async_poll()

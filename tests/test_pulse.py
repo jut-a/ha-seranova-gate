@@ -2,9 +2,12 @@
 
 Hard rules checked here:
 - CMD 6 is written exactly once, never retried;
+- nothing that can switch an output is sent before the device itself answered a
+  state request (CMD 10 with a fresh device TIME);
 - success needs the device's own access event (the cloud's ack is not enough);
 - a SEQ is never reused, also across a restart;
-- a second pulse within the lockout is refused (open/stop/close gates).
+- a second pulse within the lockout is refused (open/stop/close gates), except a
+  new press made after the device confirmed the previous pulse, after a short guard.
 
 A fake socket records every frame the hub writes and answers with scripted
 frames. Needs Home Assistant's test kit (pytest-homeassistant-custom-component).
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+import time
 from typing import Any
 
 import pytest
@@ -84,9 +88,27 @@ ACCESS_EVENT = {
 STATUS = {"CMD": 10, "UID": IMEI, "OUT": "000,010,020,030"}
 
 
+def state(age: float = 1) -> dict[str, Any]:
+    """A CMD 10 frame stamped by the device's clock `age` seconds ago."""
+    return {**STATUS, "TIME": int(time.time() - age)}
+
+
+def awake(script: Script) -> Script:
+    """The device answers state requests (CMD 10) itself; other CMDs go to `script`."""
+
+    def wrapped(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        if frame["MSG"]["CMD"] == 10:
+            return [ack(10), state()]
+        return script(frame)
+
+    return wrapped
+
+
 def gate_ok(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """A device that works: CMD 2 acked, CMD 6 acked by the cloud + access event."""
+    """A device that works: CMD 10 answered, CMD 2 acked, CMD 6 acked + access event."""
     cmd = frame["MSG"]["CMD"]
+    if cmd == 10:
+        return [ack(10), state()]
     if cmd == 2:
         return [ack(2)]
     if cmd == 6:
@@ -98,6 +120,7 @@ def gate_ok(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
 def fast_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shrink the real 1 s / 10 s waits; the retry COUNTS stay the production values."""
     monkeypatch.setattr(hub_module, "SEND_INTERVAL", 0.01)
+    monkeypatch.setattr(hub_module, "WAKE_INTERVAL", 0.01)
     monkeypatch.setattr(hub_module, "PULSE_CONFIRM_TIMEOUT", 0.05)
 
 
@@ -147,9 +170,13 @@ async def test_success_needs_the_access_event(hass: HomeAssistant) -> None:
 
     assert result.success
     assert result.confirmed_by == "access_event"
+    assert conn.count(10) == 1
     assert conn.count(2) == 1
     assert conn.count(6) == 1
-    prepare, pulse = conn.written
+    wake, prepare, pulse = conn.written  # in this order
+    assert wake["MSG"]["CMD"] == 10
+    assert wake["MSG"]["CODE"] == USER_CODE
+    assert wake["MSG"]["VAL"] == ""
     assert "CODE" not in prepare["MSG"]
     assert pulse["MSG"]["CODE"] == USER_CODE
     assert pulse["MSG"]["VAL"] == "1#2#"
@@ -157,7 +184,7 @@ async def test_success_needs_the_access_event(hass: HomeAssistant) -> None:
 
 async def test_cloud_ack_alone_is_not_success(hass: HomeAssistant) -> None:
     """The 2026-11-06 21:38 case: cloud acked in 0.2 s, the gate never moved."""
-    hub, conn = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])])
+    hub, conn = make_hub(hass, awake(lambda f: [ack(f["MSG"]["CMD"])]))
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
@@ -170,9 +197,9 @@ async def test_cloud_ack_alone_is_not_success(hass: HomeAssistant) -> None:
 
 async def test_status_frame_is_not_confirmation(hass: HomeAssistant) -> None:
     def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
-        return [ack(2)] if frame["MSG"]["CMD"] == 2 else [ack(6), STATUS]
+        return [ack(2)] if frame["MSG"]["CMD"] == 2 else [ack(6), state()]
 
-    hub, conn = make_hub(hass, script)
+    hub, conn = make_hub(hass, awake(script))
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
@@ -180,7 +207,7 @@ async def test_status_frame_is_not_confirmation(hass: HomeAssistant) -> None:
 
 
 async def test_unanswered_cmd6_is_not_retried(hass: HomeAssistant) -> None:
-    hub, conn = make_hub(hass, lambda f: [ack(2)] if f["MSG"]["CMD"] == 2 else None)
+    hub, conn = make_hub(hass, awake(lambda f: [ack(2)] if f["MSG"]["CMD"] == 2 else None))
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
@@ -190,7 +217,7 @@ async def test_unanswered_cmd6_is_not_retried(hass: HomeAssistant) -> None:
 
 
 async def test_failed_cmd6_write_is_unsafe(hass: HomeAssistant) -> None:
-    hub, conn = make_hub(hass, lambda f: [ack(2)] if f["MSG"]["CMD"] == 2 else None)
+    hub, conn = make_hub(hass, awake(lambda f: [ack(2)] if f["MSG"]["CMD"] == 2 else None))
     conn.fail_write_for = 6
     result = await hub.async_pulse(1, 2)
 
@@ -208,7 +235,7 @@ async def test_socket_closed_before_cmd6_is_fallback_safe(hass: HomeAssistant) -
             return [ack(2)]
         return None
 
-    conn.script = script
+    conn.script = awake(script)
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
@@ -217,12 +244,79 @@ async def test_socket_closed_before_cmd6_is_fallback_safe(hass: HomeAssistant) -
     assert conn.count(6) == 0
 
 
-async def test_asleep_device_never_gets_cmd6(hass: HomeAssistant) -> None:
-    hub, conn = make_hub(hass, lambda f: None)
+async def test_asleep_device_never_gets_cmd2_or_cmd6(hass: HomeAssistant) -> None:
+    """The 2026-11-07 case: everything acked by the cloud, the device silent."""
+    hub, conn = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])])
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
     assert result.stage == "wake"
+    assert result.fallback_safe is True
+    assert "did not answer a state request" in (result.error or "")
+    assert conn.count(10) == hub_module.WAKE_RETRIES + 1  # a read may be re-sent
+    assert conn.count(2) == 0
+    assert conn.count(6) == 0
+    assert hub.device_online is False
+
+
+async def test_stale_state_is_not_an_answer(hass: HomeAssistant) -> None:
+    """A CMD 10 with an old device TIME is a stored copy, not the device answering."""
+
+    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        return [ack(10), state(age=3600)] if frame["MSG"]["CMD"] == 10 else gate_ok(frame)
+
+    hub, conn = make_hub(hass, script)
+    result = await hub.async_pulse(1, 2)
+
+    assert not result.success
+    assert result.stage == "wake"
+    assert result.fallback_safe is True
+    assert "out-of-date" in (result.error or "")
+    assert conn.count(2) == 0
+    assert conn.count(6) == 0
+
+
+async def test_wake_waits_for_a_late_answer(hass: HomeAssistant) -> None:
+    """The device answers only the third state request: then the pulse goes out once."""
+    sends = {"n": 0}
+
+    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        if frame["MSG"]["CMD"] == 10:
+            sends["n"] += 1
+            return [ack(10), state()] if sends["n"] >= 3 else [ack(10)]
+        return gate_ok(frame)
+
+    hub, conn = make_hub(hass, script)
+    result = await hub.async_pulse(1, 2)
+
+    assert result.success
+    assert conn.count(10) == 3
+    assert conn.count(6) == 1
+    assert hub.recent_commands[-1]["wake_sends"] == 3
+    assert hub.recent_state_checks[-1]["answered"] is True
+
+
+async def test_wake_refused_sends_nothing_else(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(
+        hass, lambda f: [{"ERROR": 5, "UID": IMEI}] if f["MSG"]["CMD"] == 10 else None
+    )
+    result = await hub.async_pulse(1, 2)
+
+    assert not result.success
+    assert result.stage == "wake"
+    assert result.fallback_safe is True
+    assert "user code" in (result.error or "")
+    assert conn.count(10) == 1  # a refusal is final
+    assert conn.count(2) == 0
+    assert conn.count(6) == 0
+
+
+async def test_unacked_prepare_never_gets_cmd6(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, awake(lambda f: None))
+    result = await hub.async_pulse(1, 2)
+
+    assert not result.success
+    assert result.stage == "connect"  # CMD 2 is answered by the cloud itself
     assert result.fallback_safe is True
     assert conn.count(2) == hub_module.SEND_RETRIES + 1  # CMD 2 may be re-sent
     assert conn.count(6) == 0
@@ -237,7 +331,7 @@ async def test_wrong_user_code_is_not_retried(hass: HomeAssistant) -> None:
             return [{"ERROR": 5, "UID": IMEI}]
         return None
 
-    hub, conn = make_hub(hass, script)
+    hub, conn = make_hub(hass, awake(script))
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
@@ -261,7 +355,7 @@ async def test_second_pulse_within_lockout_is_refused(hass: HomeAssistant) -> No
 
 
 async def test_lockout_also_follows_an_unconfirmed_pulse(hass: HomeAssistant) -> None:
-    hub, conn = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])], make_entry(lockout=30))
+    hub, conn = make_hub(hass, awake(lambda f: [ack(f["MSG"]["CMD"])]), make_entry(lockout=30))
     assert not (await hub.async_pulse(1, 2)).success  # sent, may still open late
 
     assert (await hub.async_pulse(1, 2)).stage == "locked"
@@ -275,6 +369,59 @@ async def test_lockout_after_an_access_from_elsewhere(hass: HomeAssistant) -> No
     result = await hub.async_pulse(1, 2)
     assert result.stage == "locked"
     assert conn.written == []  # not even CMD 2
+
+
+async def test_new_press_after_confirmation_waits_only_the_guard(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stop or close the gate from HA without waiting out the full lockout."""
+    monkeypatch.setattr(hub_module, "CONFIRMED_PULSE_GUARD", 0.05)
+    hub, conn = make_hub(hass, gate_ok, make_entry(lockout=30))
+    assert (await hub.async_pulse(1, 2)).success
+
+    assert (await hub.async_pulse(1, 2)).stage == "locked"  # inside the guard
+    await asyncio.sleep(0.1)
+    assert (await hub.async_pulse(1, 2)).success
+    assert conn.count(6) == 2
+
+
+async def test_double_tap_before_confirmation_is_refused(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two presses queued together: the second was made before the first was confirmed."""
+    monkeypatch.setattr(hub_module, "CONFIRMED_PULSE_GUARD", 0)
+    hub, conn = make_hub(hass, gate_ok, make_entry(lockout=30))
+    first, second = await asyncio.gather(hub.async_pulse(1, 2), hub.async_pulse(1, 2))
+
+    assert first.success
+    assert second.stage == "locked"
+    assert conn.count(6) == 1
+
+
+async def test_unconfirmed_pulse_keeps_the_full_lockout(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hub_module, "CONFIRMED_PULSE_GUARD", 0)
+    hub, conn = make_hub(hass, awake(lambda f: [ack(f["MSG"]["CMD"])]), make_entry(lockout=30))
+    assert not (await hub.async_pulse(1, 2)).success  # sent, may still open late
+    await asyncio.sleep(0.05)
+
+    assert (await hub.async_pulse(1, 2)).stage == "locked"
+    assert conn.count(6) == 1
+
+
+async def test_another_access_after_confirmation_restarts_the_full_lockout(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeat run by the device or someone else's access: cannot be told apart."""
+    monkeypatch.setattr(hub_module, "CONFIRMED_PULSE_GUARD", 0.05)
+    hub, conn = make_hub(hass, gate_ok, make_entry(lockout=30))
+    assert (await hub.async_pulse(1, 2)).success
+    hub._handle_frames([ACCESS_EVENT])  # a second "Access Gained"
+    await asyncio.sleep(0.1)
+
+    assert (await hub.async_pulse(1, 2)).stage == "locked"
+    assert conn.count(6) == 1
 
 
 async def test_lockout_zero_disables_it(hass: HomeAssistant) -> None:
@@ -317,7 +464,7 @@ async def test_seq_wraps_inside_the_range(hass: HomeAssistant) -> None:
     hub._seq = SEQ_MAX - 1
     await hub.async_pulse(1, 2)
 
-    assert conn.seqs() == [SEQ_MAX - 1, SEQ_MIN]
+    assert conn.seqs() == [SEQ_MAX - 1, SEQ_MIN, SEQ_MIN + 1]
 
 
 # ---- events ---------------------------------------------------------------------
@@ -336,6 +483,38 @@ async def test_access_event_reaches_listeners(hass: HomeAssistant) -> None:
     assert data["message"] == "Access Gained by John (User 1)"
 
 
+# ---- Online: only the device's own frames count ---------------------------------
+
+
+async def test_cmd1_reply_does_not_prove_the_device_is_online(hass: HomeAssistant) -> None:
+    hub, _ = make_hub(hass, lambda f: None)
+    hub._handle_frames([{"CMD": 1, "UID": IMEI, "VAL": "CON:1,RSSI:31"}])
+    assert hub.device_online is None
+    assert hub.sysinfo == "CON:1,RSSI:31"
+
+    hub._handle_frames([state(age=3600)])  # a stored copy
+    assert hub.device_online is None
+
+    hub._handle_frames([state()])
+    assert hub.device_online is True
+    assert hub.last_seen is not None
+
+
+async def test_poll_follows_the_device(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])])  # the cloud acks only
+    await hub.async_poll()
+    assert hub.device_online is False
+    assert hub.recent_state_checks[-1]["answered"] is False
+    assert hub.recent_state_checks[-1]["reason"] == "poll"
+    assert hub.stats["state_checks_unanswered"] == 1
+
+    conn.script = gate_ok
+    await hub.async_poll()
+    assert hub.device_online is True
+    assert hub.recent_state_checks[-1]["answered"] is True
+    assert conn.count(6) == 0  # a poll never switches anything
+
+
 # ---- diagnostics history ------------------------------------------------------
 
 
@@ -346,8 +525,12 @@ async def test_history_records_a_confirmed_pulse(hass: HomeAssistant) -> None:
     entry = hub.recent_commands[-1]
     assert entry["success"] is True
     assert entry["confirmed_by"] == "access_event"
+    assert entry["wake_sends"] == 1
+    assert entry["wake_answered_after_s"] is not None
+    assert entry["device_lag_s"] is not None
+    assert entry["stale_state_replies"] == 0
     assert entry["prepare_sends"] == 1
-    assert entry["pulse_seq"] == conn.written[1]["MSG"]["SEQ"]
+    assert entry["pulse_seq"] == conn.written[2]["MSG"]["SEQ"]
     assert entry["cloud_ack_after_s"] is not None
     assert entry["confirmed_after_s"] is not None
     assert hub.stats["pulses_confirmed"] == 1
@@ -355,7 +538,7 @@ async def test_history_records_a_confirmed_pulse(hass: HomeAssistant) -> None:
 
 
 async def test_history_counts_every_outcome(hass: HomeAssistant) -> None:
-    hub, _ = make_hub(hass, lambda f: [ack(f["MSG"]["CMD"])], make_entry(lockout=30))
+    hub, _ = make_hub(hass, awake(lambda f: [ack(f["MSG"]["CMD"])]), make_entry(lockout=30))
     await hub.async_pulse(1, 2)  # cloud ack only: unconfirmed
     await hub.async_pulse(1, 2)  # within the lockout: refused
 

@@ -29,13 +29,18 @@ DEFAULT_PULSE_SECONDS: Final = 2
 # Minimum seconds between two pulses (also after any access the device reports):
 # on an open/stop/close gate input a second pulse stops or reverses the gate.
 DEFAULT_PULSE_LOCKOUT: Final = 30
+# Exception: once the device confirmed our pulse with its access event, a NEW press
+# (made after that event) is allowed this many seconds after it, so the gate can be
+# stopped or closed without waiting out the minimum time. A press made before the
+# event (a double tap, a queued call) still waits the full minimum time.
+CONFIRMED_PULSE_GUARD: Final = 5
 MAX_OUTPUTS: Final = 4
 
 # Frame CMD numbers (MSG.CMD when sending, CMD when receiving).
 CMD_INFO: Final = 1  # request / reply: system info (VAL)
 CMD_PREPARE: Final = 2  # sent before every output command, without CODE
 CMD_OUTPUT_PULSE: Final = 6  # VAL "<n>#<seconds>#"
-CMD_SYSTEM: Final = 10  # pushed: outputs / system state
+CMD_SYSTEM: Final = 10  # request (CODE, VAL "") / reply + pushed: outputs / system state
 CMD_EVENT: Final = 14  # pushed: EVENT {CID, TXT}
 # More commands (5 = output level, 11 = sensors) are listed in docs/PROTOCOL.md.
 
@@ -58,6 +63,16 @@ SEND_INTERVAL: Final = 1.0
 # CMD 6 is sent once and waits this long for the device's access event; the
 # cloud's ack alone does not prove the device got the command.
 PULSE_CONFIRM_TIMEOUT: Final = 10.0
+
+# Wake: before every pulse (and on each poll) ask the device for its state with
+# CMD 10, as an open web page does, and wait for the device's own answer. The
+# cloud acks every command at once, but in field tests a CMD 6 sent without this
+# reached the device about one time in three. CMD 10 is a read, safe to re-send.
+WAKE_RETRIES: Final = 6  # extra sends: 7 in all
+WAKE_INTERVAL: Final = 3.0  # seconds between sends, so about 21 s before giving up
+# A CMD 10 frame proves the device answered only when its own clock (TIME, UTC
+# epoch) is this recent; an older one is a stored copy, not an answer.
+STATE_MAX_AGE: Final = 90
 
 # Frame counter (SEQ): stored across restarts and never reused. Reusing a small
 # SEQ after a restart made the device skip a CMD 6, or run it several times.

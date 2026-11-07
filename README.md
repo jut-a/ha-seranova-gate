@@ -6,6 +6,12 @@
 Control a **Topkodas PROGATE** cellular gate controller from Home Assistant through the
 **SERANOVA** cloud (the same cloud the SERANOVA app and [seranova.eu](https://seranova.eu) use).
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/jut-a/ha-seranova-gate/main/docs/progate.png"
+       alt="Topkodas PROGATE GSM controller" width="280"><br>
+  <sub>Topkodas PROGATE. Product photo: Topkodas.</sub>
+</p>
+
 > **Unofficial.** Not affiliated with or endorsed by UAB Topkodas. The cloud protocol was
 > decoded from the public SERANOVA web app and can change without notice. You use this
 > to control a physical gate — test it while watching the gate.
@@ -33,6 +39,17 @@ Control a **Topkodas PROGATE** cellular gate controller from Home Assistant thro
 - Home Assistant 2025.3 or newer (tested on 2026.11).
 - Access events must be reported by the device (the default): an open counts as successful
   only when the PROGATE reports "Access Gained" (Contact ID 422).
+
+### Tested with
+
+- A PROGATE, firmware `052502131936` (boot `PROGATEv2_boot_v2`, as the device reports it).
+- **OUT1** (the RELAY output) wired to the gate motor controller's **step-by-step input**
+  (open → stop → close), 2 s pulse (the default). How the gate reacts to each pulse depends on the motor controller,
+  not on the PROGATE.
+- Checked live with 0.2.3: a press opens the gate (confirmed about 3 s after the press); a
+  second press after the confirmation stops it, the next one closes it; a press after a quiet
+  spell opens on the first state request.
+- Not tested: outputs 2–4, other PROGATE models or firmware, wiring to an "open only" input.
 
 ## Installation
 
@@ -80,7 +97,7 @@ Home Assistant asks you to sign in again.
 | Entity | Description |
 | --- | --- |
 | `button.<system>_<output>` | Pulses the output. Raises an error if the device did not confirm it. |
-| `binary_sensor.<system>_online` | Connectivity (holds its state through a short reconnect). Attributes: `last_seen`, `last_error`. |
+| `binary_sensor.<system>_online` | Connectivity: on when the device itself answered the last state request (each poll and before every pulse) or sent an event; the cloud's quick replies do not count. Holds its state through a short reconnect. Attributes: `last_seen` (last frame from the device), `last_error`. |
 | `sensor.<system>_last_event` | Text of the last device event, e.g. `Access Gained by John (User 1)`; shows in the logbook and history, restored after a restart. Attributes: `event_type`, `subject`, `user_or_zone`, `code`, `device_time`. |
 | `event.<system>_event` | Last device event. Types: `access_granted`, `access_denied`, `alarm`, `trouble`, `restore`, `test`, `event`. Attributes: `message`, `subject`, `subject_detail`, `user_or_zone`, `partition`, `description`, `object`, `code`, `cid`, `device_time`, `text`. |
 
@@ -95,7 +112,9 @@ response_variable: gate
 ```
 
 The response is `{success, stage, error, fallback_safe, acked, confirmed_by}`. `stage` is
-`locked`, `connect`, `wake` or `open`. `success` is `true` only when the gate itself reported
+`locked` (refused by the minimum time between pulses), `connect` (no cloud connection, or the
+cloud did not respond), `wake` (the device did not answer the state request sent before every
+pulse) or `open` (the output command itself). `success` is `true` only when the gate itself reported
 the access (`confirmed_by: access_event`); `acked` only says the cloud accepted the command,
 which is **not** proof that the gate got it. **`fallback_safe` is `true` only when the output
 command never reached the device.** If the command was sent but not confirmed, the gate may
@@ -113,6 +132,9 @@ Example: open from the cloud, fall back to an SMS only when that cannot double-t
         message: "USER123456 022 1#2#"
 ```
 
+The SMS must come from a phone number in the device's user list. All SMS commands (outputs,
+status requests, users, cloud settings): [docs/SMS.md](docs/SMS.md).
+
 Example: notify on every access:
 
 ```yaml
@@ -129,19 +151,108 @@ actions:
       message: "{{ trigger.to_state.attributes.message }}"
 ```
 
+### Example: open the gate when arriving by car
+
+Uses the Home Assistant Companion app on the phone: a `person` entering the home zone, and that
+phone's activity sensor saying the person is driving (iOS: `sensor.<phone>_activity` =
+`Automotive`; Android: `sensor.<phone>_detected_activity` = `in_vehicle`). Someone walking or
+cycling home does not open the gate. Make the home zone large enough that the gate has time to
+open before the car gets there: the cloud path takes about 3 s on top of the gate's own travel
+time.
+
+One person:
+
+```yaml
+alias: Open the gate when arriving by car
+mode: single
+triggers:
+  - trigger: zone
+    entity_id: person.john
+    zone: zone.home
+    event: enter
+conditions:
+  - condition: state
+    entity_id: sensor.johns_phone_activity
+    state: Automotive
+actions:
+  - action: seranova_gate.open
+    response_variable: gate
+```
+
+Two people:
+
+```yaml
+alias: Open the gate when arriving by car
+mode: single
+triggers:
+  - trigger: zone
+    entity_id: person.john
+    zone: zone.home
+    event: enter
+    id: john
+  - trigger: zone
+    entity_id: person.jane
+    zone: zone.home
+    event: enter
+    id: jane
+conditions:
+  # Only the person who arrived, and only if their phone says they are driving.
+  - condition: or
+    conditions:
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: john
+          - condition: state
+            entity_id: sensor.johns_phone_activity
+            state: Automotive
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: jane
+          - condition: state
+            entity_id: sensor.janes_phone_activity
+            state: Automotive
+  # Both in the same car: the second phone enters the zone seconds to a minute later.
+  # Open only once in 2 minutes. Keep this condition after the driving check, so that
+  # someone walking home does not start the 2 minutes.
+  - condition: template
+    value_template: >
+      {{ this.attributes.last_triggered is none
+         or now() - this.attributes.last_triggered > timedelta(minutes=2) }}
+actions:
+  - action: seranova_gate.open
+    response_variable: gate
+```
+
+**Keep the 2-minute condition.** Once the gate has confirmed a pulse, the integration accepts a
+new press 5 s later (so you can stop or close the gate yourself), and the second phone's
+arrival would be such a press: on an open → stop → close input it would stop the opening gate.
+
+To fall back to an SMS when the cloud cannot be used, add the `if:` step from the example
+above after `seranova_gate.open`. Use `seranova_gate.open` rather than pressing the button: the
+action returns its result instead of failing the automation.
+
 ## Safety
 
 Many gate motors take the PROGATE pulse on an **open → stop → close** input, so every extra
 pulse stops or reverses the gate. The integration therefore:
 
+- sends nothing that can switch an output until the **device itself has answered a state
+  request** — the cloud accepts commands for a device that is not listening, and they are lost;
 - sends the output command **exactly once** — the device does not de-duplicate a re-sent
-  command, so a retry would pulse the gate again; only the harmless "prepare" step is retried;
+  command, so a retry would pulse the gate again; only the harmless state request and
+  "prepare" step are retried;
 - reports **success only when the gate itself reports the access** — the cloud acknowledges a
   command within a fraction of a second even when the device never receives it;
 - never reuses a frame sequence number (SEQ), also across restarts — reusing one made the
   device skip a command, or run it several times;
 - refuses a new pulse for the **minimum time between pulses** (default 30 s) after the last
-  pulse or after any access the device reported (app, SMS, key fob).
+  pulse or after any access the device reported (app, SMS, key fob). One exception, so the gate
+  can be stopped or closed from Home Assistant: once the device has confirmed a pulse with its
+  access event, a **new** press made after that event is allowed 5 s after it. A double tap or
+  a press queued before the confirmation still waits the full time, and so does a press after
+  any other access event.
 
 If your PROGATE relay is wired to an "open only" input, extra pulses are harmless and you can
 set the minimum time to `0`. Details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
@@ -151,6 +262,7 @@ set the minimum time to `0`. Details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 | Symptom | What to check |
 | --- | --- |
 | **Online is off** | The device in the SERANOVA app: the SIM needs mobile data and SERA Cloud Service must be on. The device keeps its cloud link alive with a ping every `PING` seconds (default 600). |
+| **"did not answer a state request"** (stage `wake`) | Before every pulse the integration asks the device for its state and waits about 20 s for its own answer; none came, so nothing was sent to the gate and an SMS fallback is safe. Same checks as *Online is off*; the diagnostics' `recent_state_checks` show how long the device usually takes to answer. |
 | **"the gate did not confirm it"** | The cloud accepted the command but the device never reported the access. Check the SERANOVA event log: no entry means the device never got it; a late entry means a slow mobile link. |
 | **"the gate was operated moments ago"** | The minimum time between pulses (Options) refused a second pulse. Set it to `0` only if your gate input is "open only". |
 | **Wrong App Key / user code** | Use *Reconfigure*. |

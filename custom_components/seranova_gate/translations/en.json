@@ -65,7 +65,7 @@
     "step": {
       "init": {
         "title": "Outputs and status polling",
-        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off. The minimum time between pulses refuses a new pulse that soon after the last one or after any access the device reported: on an open/stop/close gate a second pulse stops or reverses it (0 turns the protection off).",
+        "description": "Each enabled output gets a button that pulses it for the given number of seconds (the same as SMS command 022 N#SECONDS#). Polling asks the device for its status so the Online sensor stays current; 0 turns it off. The minimum time between pulses refuses a new pulse that soon after the last one or after any access the device reported: on an open/stop/close gate a second pulse stops or reverses it (0 turns the protection off). Once the device has confirmed a pulse, a new press made after that is allowed 5 s later, so the gate can still be stopped or closed.",
         "data": {
           "poll_minutes": "Status poll interval",
           "pulse_lockout": "Minimum time between pulses",
