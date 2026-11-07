@@ -66,7 +66,12 @@ def parse_event(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
     device_time = None
     if (ts := _as_int(event.get("TIME"))) is not None and ts > 0:
-        device_time = datetime.fromtimestamp(ts, UTC).isoformat()
+        # A TIME outside the platform's range raises (ValueError, OSError or
+        # OverflowError, depending on the value); treat it as no device time.
+        try:
+            device_time = datetime.fromtimestamp(ts, UTC).isoformat()
+        except (ValueError, OSError, OverflowError):
+            device_time = None
 
     attributes = {
         "message": message,

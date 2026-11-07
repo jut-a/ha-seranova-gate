@@ -151,6 +151,10 @@ class SeranovaWebApi:
         # Cookies are kept per account; the shared session has no cookie jar.
         self._cookies: dict[str, str] = {}
 
+    def signs_in_as(self, email: str, password: str) -> bool:
+        """True if this instance uses exactly these credentials."""
+        return self._email == email and self._password == password
+
     def _headers(self, path: str = "/login") -> dict[str, str]:
         headers = {
             "User-Agent": USER_AGENT,
@@ -393,7 +397,11 @@ class SocketIoConnection:
         for arg in args[1:]:
             frames.extend(decode_payload(arg))
         if frames:
-            self._on_frames(frames)
+            # A bug in frame handling must not end the read loop (and the connection).
+            try:
+                self._on_frames(frames)
+            except Exception:
+                _LOGGER.exception("Error while handling a frame from the SERANOVA cloud")
 
 
 def _json_or_empty(text: str) -> dict[str, Any]:

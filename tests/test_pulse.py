@@ -32,7 +32,12 @@ from homeassistant.config_entries import ConfigEntryState  # noqa: E402
 from homeassistant.core import HomeAssistant  # noqa: E402
 from pytest_homeassistant_custom_component.common import MockConfigEntry  # noqa: E402
 
-from custom_components.seranova_gate import async_setup, diagnostics  # noqa: E402
+from custom_components.seranova_gate import (  # noqa: E402
+    SETUP_READY_TIMEOUT,
+    _web_api,
+    async_setup,
+    diagnostics,
+)
 from custom_components.seranova_gate import hub as hub_module  # noqa: E402
 from custom_components.seranova_gate.api import (  # noqa: E402
     CannotConnect,
@@ -763,3 +768,83 @@ async def test_get_events_action(hass: HomeAssistant) -> None:
     assert result["count"] == 1
     assert result["logged"] == 1
     assert result["events"][0]["type"] == "access_granted"
+
+
+# ---- 0.2.5 fixes ----------------------------------------------------------------
+
+
+async def test_out_of_range_event_time_keeps_the_connection_alive(hass: HomeAssistant) -> None:
+    hub, _ = make_hub(hass, gate_ok)
+    hub._handle_frames([access_event(10**12)])  # must not raise
+    assert hub.event_log[-1]["device_time"] is None
+    assert hub.event_log[-1]["time"]  # falls back to the received time
+
+
+async def test_setup_retries_reuse_the_signed_in_session(hass: HomeAssistant) -> None:
+    first = _web_api(hass, None, "john@example.com", "pw")  # type: ignore[arg-type]
+    first.token = "kept"
+    assert _web_api(hass, None, "john@example.com", "pw") is first  # type: ignore[arg-type]
+    changed = _web_api(hass, None, "john@example.com", "new")  # type: ignore[arg-type]
+    assert changed is not first
+    assert changed.token is None
+
+
+def test_setup_waits_long_enough_for_the_worst_case() -> None:
+    # socket connect 20 s + CMD 1 3 x 5 s + state request (WAKE_RETRIES + 1) x WAKE_INTERVAL
+    worst = 20 + 15 + (hub_module.WAKE_RETRIES + 1) * hub_module.WAKE_INTERVAL
+    assert worst < SETUP_READY_TIMEOUT
+
+
+async def test_a_dropped_socket_is_not_an_unanswered_check(hass: HomeAssistant) -> None:
+    hub, conn = make_hub(hass, gate_ok)
+    conn.fail_write_for = 10
+    await hub.async_poll()
+    assert hub.recent_state_checks[-1]["outcome"] == "error"
+    assert hub.stats["state_checks_unanswered"] == 0
+    assert not hub._ready.done()  # the setup still waits for a real answer
+
+    conn.fail_write_for = None
+    await hub.async_poll()
+    await hub.async_wait_ready(0.1)
+
+
+async def test_a_refused_check_says_so(hass: HomeAssistant) -> None:
+    hub, _ = make_hub(hass, lambda f: [{"ERROR": 4, "UID": IMEI}])
+    await hub.async_poll()
+    assert hub.recent_state_checks[-1]["outcome"] == "refused"
+    assert hub.stats["state_checks_unanswered"] == 0
+    with pytest.raises(hub_module.DeviceUnavailable, match="App Key"):
+        await hub.async_wait_ready(0.1)
+
+
+async def test_a_controller_with_a_wrong_clock_still_counts_as_answering(
+    hass: HomeAssistant,
+) -> None:
+    """Its replies are an hour off, but each is stamped later than the one before."""
+    stamp = {"t": int(time.time()) - 3600}
+
+    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        if frame["MSG"]["CMD"] == 10:
+            stamp["t"] += 3
+            return [ack(10), {**STATUS, "TIME": stamp["t"]}]
+        return gate_ok(frame)
+
+    hub, conn = make_hub(hass, script)
+    result = await hub.async_pulse(1, 2)
+    assert result.success
+    assert conn.count(10) == 2  # the second reply proves the round trip
+    assert conn.count(6) == 1
+    assert hub.device_online is True
+
+
+async def test_a_repeated_old_copy_never_counts_and_names_the_clock(
+    hass: HomeAssistant,
+) -> None:
+    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        return [ack(10), state(age=3600)] if frame["MSG"]["CMD"] == 10 else gate_ok(frame)
+
+    hub, conn = make_hub(hass, script)
+    result = await hub.async_pulse(1, 2)
+    assert result.stage == "wake"
+    assert "clock may be off" in (result.error or "")
+    assert conn.count(6) == 0

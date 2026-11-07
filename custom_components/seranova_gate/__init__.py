@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import logging
 
+import aiohttp
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import (
@@ -68,8 +69,24 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.EVENT, Platform.SENSOR]
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-# Setup waits this long for the gate controller to answer a state request.
-SETUP_READY_TIMEOUT = 45
+# Setup waits this long for the gate controller to answer a state request: socket
+# connect (up to 20 s) + CMD 1 (3 x 5 s) + the state request (7 x 3 s) = 56 s worst case.
+SETUP_READY_TIMEOUT = 75
+# One signed-in SERANOVA web session per account, kept across setup retries and
+# reloads: a fresh REST login on every retry (every ~80 s while the gate controller
+# is offline) would add up to hundreds of logins a night and trigger the captcha.
+DATA_WEB_SESSIONS = f"{DOMAIN}_web_sessions"
+
+
+def _web_api(
+    hass: HomeAssistant, session: aiohttp.ClientSession, email: str, password: str
+) -> SeranovaWebApi:
+    """The kept web session for this account (a new one if the password changed)."""
+    sessions: dict[str, SeranovaWebApi] = hass.data.setdefault(DATA_WEB_SESSIONS, {})
+    web = sessions.get(email)
+    if web is None or not web.signs_in_as(email, password):
+        web = sessions[email] = SeranovaWebApi(session, email, password)
+    return web
 
 type SeranovaConfigEntry = ConfigEntry[SeranovaHub]
 
@@ -172,9 +189,12 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> bool:
     """Log in, open the persistent cloud connection and add the entities."""
     session = async_get_session(hass)
-    web = SeranovaWebApi(session, entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD])
+    web = _web_api(hass, session, entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD])
     try:
-        await web.login()
+        # Reuse a kept token; the connection refreshes it or signs in again only
+        # when the cloud rejects it.
+        if web.token is None:
+            await web.login()
     except InvalidAuth as err:
         raise ConfigEntryAuthFailed("SERANOVA rejected the e-mail or password") from err
     except TwoFactorRequired as err:

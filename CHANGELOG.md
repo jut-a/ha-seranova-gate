@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.5
+
+### Fixed
+- An unexpected error while handling a cloud frame no longer ends the connection for good
+  (the entry stayed "loaded" without a socket until a restart). Frame handling and the
+  connection loop now log such an error and carry on; an event whose `TIME` is out of range
+  is kept without a device time instead of raising.
+- Retrying setup reuses the signed-in SERANOVA session instead of logging in again on every
+  retry (every ~80 s while the gate controller is offline), which could trigger the captcha.
+- Only a state request that really timed out counts as "did not answer"; a dropped socket no
+  longer does, and a refused App Key / user code is reported as such.
+- Setup now waits up to 75 s for the gate controller (the worst case is 56 s; it was 45 s).
+- A gate controller whose clock is off by more than 90 s no longer looks unreachable: a state
+  reply stamped later than any seen before also proves it answered, and the error names the
+  clock offset when every reply looked out of date.
+
+### Changed
+- `pyproject.toml` version follows the manifest; icons for `get_events` and Last event time.
+- README: how fast the event log grows.
+
 ## 0.2.4
 
 ### Added

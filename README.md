@@ -250,8 +250,10 @@ action returns its result instead of failing the automation.
 Every event the gate controller reports is also written to the integration's own event log,
 in Home Assistant's storage (`.storage/seranova_gate.<IMEI>.events`, part of every backup).
 The recorder does not touch it, so it is not purged after `purge_keep_days`. It keeps events
-for the number of days set in the options; the default `0` keeps them forever (about 300 bytes
-per event). It belongs to the device, not the config entry: removing and adding the
+for the number of days set in the options; the default `0` keeps them forever. Each event
+takes about 300 bytes, so a home gate with 5–20 events a day adds roughly 0.5–2 MB a year; the
+file is rewritten at most every 2 s while events arrive. Set the days option if your site is
+much busier. It belongs to the device, not the config entry: removing and adding the
 integration again keeps it.
 
 ```yaml

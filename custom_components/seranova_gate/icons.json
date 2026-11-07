@@ -11,6 +11,9 @@
     "sensor": {
       "last_event": {
         "default": "mdi:message-text-clock-outline"
+      },
+      "last_event_time": {
+        "default": "mdi:clock-check-outline"
       }
     },
     "event": {
@@ -22,6 +25,9 @@
   "services": {
     "open": {
       "service": "mdi:gate-open"
+    },
+    "get_events": {
+      "service": "mdi:clipboard-text-clock-outline"
     }
   }
 }
