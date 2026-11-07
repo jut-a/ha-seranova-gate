@@ -72,20 +72,25 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 # Setup waits this long for the gate controller to answer a state request: socket
 # connect (up to 20 s) + CMD 1 (3 x 5 s) + the state request (7 x 3 s) = 56 s worst case.
 SETUP_READY_TIMEOUT = 75
-# One signed-in SERANOVA web session per account, kept across setup retries and
+# One signed-in SERANOVA web session per config entry, kept across setup retries and
 # reloads: a fresh REST login on every retry (every ~80 s while the gate controller
 # is offline) would add up to hundreds of logins a night and trigger the captcha.
+# Per entry, not per account: entries never refresh or reset each other's token.
 DATA_WEB_SESSIONS = f"{DOMAIN}_web_sessions"
 
 
 def _web_api(
-    hass: HomeAssistant, session: aiohttp.ClientSession, email: str, password: str
+    hass: HomeAssistant,
+    entry_id: str,
+    session: aiohttp.ClientSession,
+    email: str,
+    password: str,
 ) -> SeranovaWebApi:
-    """The kept web session for this account (a new one if the password changed)."""
+    """The kept web session of this entry; a new one if the login or HTTP session changed."""
     sessions: dict[str, SeranovaWebApi] = hass.data.setdefault(DATA_WEB_SESSIONS, {})
-    web = sessions.get(email)
-    if web is None or not web.signs_in_as(email, password):
-        web = sessions[email] = SeranovaWebApi(session, email, password)
+    web = sessions.get(entry_id)
+    if web is None or not web.matches(session, email, password):
+        web = sessions[entry_id] = SeranovaWebApi(session, email, password)
     return web
 
 type SeranovaConfigEntry = ConfigEntry[SeranovaHub]
@@ -189,7 +194,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> bool:
     """Log in, open the persistent cloud connection and add the entities."""
     session = async_get_session(hass)
-    web = _web_api(hass, session, entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD])
+    web = _web_api(
+        hass, entry.entry_id, session, entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD]
+    )
     try:
         # Reuse a kept token; the connection refreshes it or signs in again only
         # when the cloud rejects it.
@@ -237,5 +244,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) ->
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: SeranovaConfigEntry) -> None:
-    """Delete the stored frame counter with the entry."""
+    """Delete the stored frame counter and the kept web session with the entry."""
+    hass.data.get(DATA_WEB_SESSIONS, {}).pop(entry.entry_id, None)
     await Store(hass, SEQ_STORAGE_VERSION, seq_storage_key(entry.entry_id)).async_remove()

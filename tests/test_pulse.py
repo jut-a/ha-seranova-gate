@@ -781,12 +781,18 @@ async def test_out_of_range_event_time_keeps_the_connection_alive(hass: HomeAssi
 
 
 async def test_setup_retries_reuse_the_signed_in_session(hass: HomeAssistant) -> None:
-    first = _web_api(hass, None, "john@example.com", "pw")  # type: ignore[arg-type]
+    http, other_http = object(), object()
+    first = _web_api(hass, "entry1", http, "john@example.com", "pw")  # type: ignore[arg-type]
     first.token = "kept"
-    assert _web_api(hass, None, "john@example.com", "pw") is first  # type: ignore[arg-type]
-    changed = _web_api(hass, None, "john@example.com", "new")  # type: ignore[arg-type]
+    assert _web_api(hass, "entry1", http, "john@example.com", "pw") is first  # type: ignore[arg-type]
+    # Another entry on the same account gets its own: no shared token to reset.
+    assert _web_api(hass, "entry2", http, "john@example.com", "pw") is not first  # type: ignore[arg-type]
+    # A new password or a replaced (closed) HTTP session gives a fresh one.
+    changed = _web_api(hass, "entry1", http, "john@example.com", "new")  # type: ignore[arg-type]
     assert changed is not first
     assert changed.token is None
+    renewed = _web_api(hass, "entry1", other_http, "john@example.com", "new")  # type: ignore[arg-type]
+    assert renewed is not changed
 
 
 def test_setup_waits_long_enough_for_the_worst_case() -> None:

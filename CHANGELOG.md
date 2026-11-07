@@ -7,8 +7,10 @@
   (the entry stayed "loaded" without a socket until a restart). Frame handling and the
   connection loop now log such an error and carry on; an event whose `TIME` is out of range
   is kept without a device time instead of raising.
-- Retrying setup reuses the signed-in SERANOVA session instead of logging in again on every
-  retry (every ~80 s while the gate controller is offline), which could trigger the captcha.
+- Retrying setup reuses the entry's signed-in SERANOVA session instead of logging in again on
+  every retry (every ~80 s while the gate controller is offline), which could trigger the
+  captcha. The session is kept per config entry (entries on one account never reset each
+  other's token) and replaced when the login or Home Assistant's HTTP session changes.
 - Only a state request that really timed out counts as "did not answer"; a dropped socket no
   longer does, and a refused App Key / user code is reported as such.
 - Setup now waits up to 75 s for the gate controller (the worst case is 56 s; it was 45 s).

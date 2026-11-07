@@ -151,9 +151,11 @@ class SeranovaWebApi:
         # Cookies are kept per account; the shared session has no cookie jar.
         self._cookies: dict[str, str] = {}
 
-    def signs_in_as(self, email: str, password: str) -> bool:
-        """True if this instance uses exactly these credentials."""
-        return self._email == email and self._password == password
+    def matches(self, session: aiohttp.ClientSession, email: str, password: str) -> bool:
+        """True if this instance uses this HTTP session and exactly these credentials."""
+        return (
+            self._session is session and self._email == email and self._password == password
+        )
 
     def _headers(self, path: str = "/login") -> dict[str, str]:
         headers = {
