@@ -48,7 +48,7 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
 
 ## Testing
 
-Automated (CI runs both on every push):
+Automated (CI runs pytest and ruff on every push):
 - `pytest` — `tests/test_events.py` and `tests/test_api.py` run without Home Assistant (they load
   the HA-free modules by file path); `tests/test_pulse.py` needs `pip install -r
   requirements_test.txt` (HA's test kit, **Python 3.14**; on a 3.13 host install
@@ -60,6 +60,17 @@ Automated (CI runs both on every push):
 - Dependabot (`.github/dependabot.yml`) opens `chore:` PRs — GitHub Actions monthly, the
   pinned test kit in `requirements_test.txt` weekly. A red test-kit bump means a new Home
   Assistant release breaks the integration: fix the code, don't pin the kit back.
+- Deprecations fail the tests: an autouse fixture in `tests/conftest.py` fails any test during
+  which HA logs "Detected that custom integration 'seranova_gate' …" or "The deprecated … was
+  called from seranova_gate". The message names the replacement and the HA version that
+  removes the old API — fix it then, don't filter the message.
+- `.github/workflows/ha-beta.yaml` (Thursdays + manual): the tests on the newest HA from PyPI,
+  beta included, installed over the pinned kit — about a week's warning before each release.
+  Not run on PRs (never blocks a merge); a red run e-mails the owner. It can fail because the
+  kit doesn't match the newer HA — read the log first.
+- Test frames with an old device `TIME` that must count as the *same* stored copy are stamped
+  once (`stored_copy_script`); two `state(age=…)` calls can differ by a second, and a newer
+  `TIME` is correctly accepted as a device with a wrong clock (this made CI flaky).
 
 Live: there is no simulator; test against a real device while someone watches the gate.
 - Install into a HA instance by symlinking `custom_components/seranova_gate` into its

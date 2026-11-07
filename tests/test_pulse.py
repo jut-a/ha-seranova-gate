@@ -108,6 +108,21 @@ def state(age: float = 1) -> dict[str, Any]:
     return {**STATUS, "TIME": int(time.time() - age)}
 
 
+def stored_copy_script(age: float = 3600) -> Script:
+    """The cloud answers every state request with the same stored frame.
+
+    The frame is stamped once: two calls to state() can fall on either side of a
+    second boundary, and a later TIME is (correctly) taken as the device answering
+    with a wrong clock.
+    """
+    old = state(age=age)
+
+    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
+        return [ack(10), dict(old)] if frame["MSG"]["CMD"] == 10 else gate_ok(frame)
+
+    return script
+
+
 def awake(script: Script) -> Script:
     """The device answers state requests (CMD 10) itself; other CMDs go to `script`."""
 
@@ -283,11 +298,7 @@ async def test_asleep_device_never_gets_cmd2_or_cmd6(hass: HomeAssistant) -> Non
 
 async def test_stale_state_is_not_an_answer(hass: HomeAssistant) -> None:
     """A CMD 10 with an old device TIME is a stored copy, not the device answering."""
-
-    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
-        return [ack(10), state(age=3600)] if frame["MSG"]["CMD"] == 10 else gate_ok(frame)
-
-    hub, conn = make_hub(hass, script)
+    hub, conn = make_hub(hass, stored_copy_script())
     result = await hub.async_pulse(1, 2)
 
     assert not result.success
@@ -846,10 +857,7 @@ async def test_a_controller_with_a_wrong_clock_still_counts_as_answering(
 async def test_a_repeated_old_copy_never_counts_and_names_the_clock(
     hass: HomeAssistant,
 ) -> None:
-    def script(frame: dict[str, Any]) -> list[dict[str, Any]] | None:
-        return [ack(10), state(age=3600)] if frame["MSG"]["CMD"] == 10 else gate_ok(frame)
-
-    hub, conn = make_hub(hass, script)
+    hub, conn = make_hub(hass, stored_copy_script())
     result = await hub.async_pulse(1, 2)
     assert result.stage == "wake"
     assert "clock may be off" in (result.error or "")
