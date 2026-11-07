@@ -57,3 +57,11 @@ def test_cid_without_text_names_the_code() -> None:
     _, attrs = events.parse_event({"CID": "160200000"})
     assert attrs["message"] == "Contact ID 160200000"
     assert attrs["code"] == "602"
+
+
+def test_out_of_range_time_is_dropped_not_raised() -> None:
+    """datetime.fromtimestamp raises ValueError / OSError / OverflowError on these."""
+    for stamp in (10**12, 10**18, 2**63):
+        _, attrs = events.parse_event({**ACCESS, "TIME": stamp})
+        assert attrs["device_time"] is None
+        assert attrs["message"] == "Access Gained by John (User 1)"

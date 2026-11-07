@@ -58,3 +58,11 @@ def test_not_sent_is_a_socket_closed() -> None:
     # The command path treats NotSent as "nothing written" and any other
     # SocketClosed as "maybe written"; the hierarchy must stay this way.
     assert issubclass(api.NotSent, api.SocketClosed)
+
+
+def test_an_error_in_frame_handling_does_not_end_the_read_loop() -> None:
+    def broken(frames: list) -> None:
+        raise ValueError("bug in the handler")
+
+    conn = api.SocketIoConnection(None, "token", broken)
+    conn._dispatch('42["message","{\\"CMD\\":1}"]')  # logged, not raised

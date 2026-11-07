@@ -210,24 +210,34 @@ class StateCheck:
     """Confirms a CMD 10 request: only the device's own, freshly stamped state frame.
 
     The cloud acks the request at once and may hand out a stored copy, so neither
-    the ack nor an old frame proves the device answered.
+    the ack nor an old frame proves the device answered. A frame proves it when its
+    TIME (the device's clock) is within STATE_MAX_AGE of now, or newer than every
+    device TIME seen before: a stored copy repeats an old TIME, so this also works
+    for a controller whose clock is off.
     """
 
-    def __init__(self) -> None:
-        """Nothing seen yet."""
+    def __init__(self, newest_seen: int | None = None) -> None:
+        """newest_seen: the newest device TIME known before this request."""
         self.stale = 0
         self.lag: float | None = None
+        self.offset: float | None = None  # how far off the last out-of-date reply was
+        self._newest = newest_seen
 
     def __call__(self, frame: dict[str, Any]) -> str | None:
         """Label for a fresh state frame, else None."""
         age = state_age(frame, time.time())
         if age is None:
             return None
-        if abs(age) > STATE_MAX_AGE:
-            self.stale += 1
-            return None
-        self.lag = round(age, 1)
-        return "device_state"
+        stamp = as_int(frame.get("TIME"))
+        newer = self._newest is not None and stamp is not None and stamp > self._newest
+        if abs(age) <= STATE_MAX_AGE or newer:
+            self.lag = round(age, 1)
+            return "device_state"
+        self.stale += 1
+        self.offset = round(age, 1)
+        if self._newest is None:
+            self._newest = stamp  # a later reply stamped after it proves a round trip
+        return None
 
 
 @dataclass(slots=True)
@@ -378,6 +388,7 @@ class SeranovaHub:
         self._connect_failures_in_a_row = 0
         self._unanswered_in_a_row = 0
         self._reload_requested = False
+        self._newest_state_time: int | None = None  # newest device TIME in a CMD 10
         # Resolved when the device first answers a state request; setup waits for it.
         self._ready: asyncio.Future[None] = hass.loop.create_future()
         self._ready.add_done_callback(lambda f: f.cancelled() or f.exception())
@@ -468,9 +479,13 @@ class SeranovaHub:
                 else:
                     self._ready.set_exception(LoginRejected("SERANOVA rejected the login"))
                 return
-            except (SeranovaError, aiohttp.ClientError, TimeoutError) as err:
+            except Exception as err:
+                # Anything else is a bug; log it and carry on through the normal
+                # backoff, so one bad frame cannot leave the entry without a socket.
                 if self._closing:
                     return
+                if not isinstance(err, (SeranovaError, aiohttp.ClientError, TimeoutError)):
+                    _LOGGER.exception("Unexpected error in the SERANOVA connection; reconnecting")
                 reason = str(err) or type(err).__name__
                 if self._established:
                     self._connect_failures_in_a_row = 0
@@ -673,7 +688,7 @@ class SeranovaHub:
                     # most likely the cloud's copy of the device's connect message, so
                     # it does not prove the device is reachable.
                     self.sysinfo = frame.get("VAL")
-                elif cmd != CMD_SYSTEM or is_fresh_state(frame, time.time()):
+                elif cmd != CMD_SYSTEM or self._is_device_state(frame):
                     # A device frame: an event, or state stamped by the device's clock.
                     self.last_seen = dt_util.utcnow()
                     self.device_online = True
@@ -684,6 +699,16 @@ class SeranovaHub:
                 waiter.feed(frame)
         if changed:
             self._notify()
+
+    @callback
+    def _is_device_state(self, frame: dict[str, Any]) -> bool:
+        """A CMD 10 frame from the device itself (fresh by its clock, or a newer TIME)."""
+        stamp = as_int(frame.get("TIME"))
+        if stamp is None:
+            return False
+        newest = self._newest_state_time
+        self._newest_state_time = stamp if newest is None else max(newest, stamp)
+        return is_fresh_state(frame, time.time()) or (newest is not None and stamp > newest)
 
     @callback
     def _dispatch_event(self, frame: dict[str, Any]) -> None:
@@ -972,7 +997,7 @@ class SeranovaHub:
             # Wake: the device's own answer to a state request (CMD 10) before anything
             # that can switch an output, as an open web page has before its button is
             # pressed. Without it the cloud acks CMD 6 but the device often never gets it.
-            trace["wake"] = _Waiter(None, confirm=StateCheck())
+            trace["wake"] = _Waiter(None, confirm=StateCheck(self._newest_state_time))
             try:
                 await self._check_device(trace["wake"], "pulse")
             except SeranovaError as err:
@@ -1048,6 +1073,7 @@ class SeranovaHub:
         """
         started = time.monotonic()
         started_wall = dt_util.utcnow()
+        outcome = "error"  # socket trouble: the reconnect logic deals with it
         try:
             await self._send(
                 CMD_SYSTEM,
@@ -1057,28 +1083,44 @@ class SeranovaHub:
                 retries=WAKE_RETRIES,
                 interval=WAKE_INTERVAL,
             )
+            outcome = "answered"
         except CommandTimeout as err:
+            outcome = "timeout"
             self.device_online = False
             self._notify()
             check = waiter.confirm
-            stale = check.stale if isinstance(check, StateCheck) else 0
-            detail = f" (only {stale} out-of-date state replies)" if stale else ""
+            detail = ""
+            if isinstance(check, StateCheck) and check.stale:
+                detail = f" (only {check.stale} out-of-date replies"
+                if check.offset is not None:
+                    detail += f"; its clock may be off by {check.offset:.0f} s"
+                detail += ")"
             raise CommandTimeout(
                 "the gate controller did not answer a state request in "
                 f"{time.monotonic() - started:.0f} s{detail}; nothing was sent to the gate"
             ) from err
+        except DeviceRefused as err:
+            outcome = "refused"
+            self._set_unavailable(str(err))  # wrong App Key / user code / IMEI
+            raise
         finally:
-            self._record_state_check(reason, waiter, started, started_wall)
+            self._record_state_check(reason, waiter, started, started_wall, outcome)
 
     @callback
     def _record_state_check(
-        self, reason: str, waiter: _Waiter, started: float, started_wall: datetime
+        self,
+        reason: str,
+        waiter: _Waiter,
+        started: float,
+        started_wall: datetime,
+        outcome: str,
     ) -> None:
         check = waiter.confirm if isinstance(waiter.confirm, StateCheck) else None
-        answered = waiter.done_at is not None
+        answered = outcome == "answered"
         entry = {
             "time": started_wall.isoformat(),
             "reason": reason,
+            "outcome": outcome,
             "answered": answered,
             "sends": waiter.attempts,
             "answered_after_s": round(waiter.done_at - started, 2) if answered else None,
@@ -1092,7 +1134,7 @@ class SeranovaHub:
             self._unanswered_in_a_row = 0
             if not self._ready.done():
                 self._ready.set_result(None)
-        else:
+        elif outcome == "timeout":
             self.stats["state_checks_unanswered"] += 1
             self._unanswered_in_a_row += 1
             if not self._ready.done() or self._unanswered_in_a_row >= 2:
@@ -1105,7 +1147,9 @@ class SeranovaHub:
             return
         async with self._cmd_lock:
             try:
-                await self._check_device(_Waiter(None, confirm=StateCheck()), "poll")
+                await self._check_device(
+                    _Waiter(None, confirm=StateCheck(self._newest_state_time)), "poll"
+                )
             except DeviceRefused as err:
                 self.last_error = str(err)
             except SeranovaError:
