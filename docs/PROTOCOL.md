@@ -68,11 +68,11 @@ parsing (the web app does the same).
 
 | CMD | Direction | Meaning |
 | --- | --- | --- |
-| 1 | → / ← | System info request (`CODE`, `VAL ""`) / reply `VAL` string (see below). |
+| 1 | → / ← | System info request (`CODE`, `VAL ""`) / reply `VAL` string (see below). The reply comes within seconds even while the device runs no commands — most likely the cloud's copy of the device's connect message, so it is no proof the device is reachable. |
 | 2 | → | "Prepare" — the web app sends it before every output command, **without CODE**, `VAL null`. Acked with `{"ack":{"cmd":2}}`. Safe to re-send. |
 | 5 | → | Output level: `VAL "<n>#<state>"` (preceded by CMD 2). |
 | 6 | → | **Output pulse**: `VAL "<n>#<seconds>#"` (same as SMS `USER<code> 022 n#seconds#`). Acked with `{"ack":{"cmd":6}}`. |
-| 10 | ← | System/outputs: `{"OUT":"000,010,020,030","ZN":"0000,0100,0200,0300","SYS":"010D,0210,0300,0400","SV":23.3,"RSSI":31,"TIME":…}` (`SV` = supply voltage). |
+| 10 | → / ← | State request (`CODE`, `VAL ""`) / reply, also pushed after a change — system/outputs: `{"OUT":"000,010,020,030","ZN":"0000,0100,0200,0300","SYS":"010D,0210,0300,0400","SV":23.3,"RSSI":31,"TIME":…}` (`SV` = supply voltage). |
 | 11 | ← | Sensors: `{"SEN":"000000000000","TIME":…}`. |
 | 14 | ← | Event: `{"EVENT":{"CID":"142200001","TXT":"…","TIME":…,"COPT":"…","NOTE":""}}`. |
 
@@ -108,6 +108,34 @@ John
 User 1
 ```
 
+## Wake the device before an output command
+
+The cloud acknowledges every command at once whether or not the device is listening. In
+field tests a CMD 2 → CMD 6 sequence sent on its own reached the device about one time in
+three (the rest were acked and lost), while the web app opened the gate every time. The
+difference is what an open page sends **before** the button is pressed:
+
+1. The system page shows a grey dot, then sends **CMD 10** with `CODE` = user code, `VAL ""`
+   (a state request).
+2. Every widget on the page (system panel, each output, sensors) runs the same small state
+   machine: no info yet → CMD 1 (`CODE`, `VAL ""`); once a CMD 1 frame arrives → CMD 10; then
+   idle, asking for CMD 10 again every 60 s (panel) or 120 s (outputs) while the page is open.
+3. An unanswered request is re-sent after 4 s (the re-sends omit `CODE`); after 2 failures the
+   machine starts over, so an open page keeps asking until the device answers.
+4. A request counts as answered only by the **frame with that CMD**, never by `{ack}`. The dot
+   turns green on a CMD 1 frame; the output states appear with the CMD 10 frame (usually 1–2 s
+   after login).
+
+By the time the user presses a button the device has just answered, and the CMD 6 lands. Only
+`message` frames are sent over the socket; there is no subscribe event and no MQTT. The REST
+call `POST /command {uid, cmd:"12"}` is made only when a system is picked in the list.
+
+A CMD 10 frame carries the device's own `TIME` (UTC epoch), so a reply whose `TIME` is within
+a minute or so of now proves a device round trip; an old `TIME` is a stored copy. The
+integration (0.2.3+) sends CMD 10 before every pulse and on each poll, re-sending every 3 s
+for about 21 s, and sends CMD 2 and CMD 6 only after a fresh CMD 10 frame. If none comes, the
+pulse fails with stage `wake` and nothing that can switch an output was sent.
+
 ## Output commands must not be retried
 
 The web app re-sends a command frame every second (up to 10 extra times) until it sees the
@@ -122,7 +150,8 @@ integration therefore re-sends only CMD 2 and sends CMD 6 exactly once.
 cellular device: it is the **cloud's** acknowledgement. In one test the ack came and the
 device never ran the command (nothing in its event log). Only the device's own CMD 14 event
 with Contact ID 422 ("Access Gained") proves the output switched; CMD 10 frames are no proof
-either, they also arrive whenever an app polls the device.
+either, they also arrive whenever an app polls the device (they prove the device is reachable,
+not that it ran the command).
 
 ## Never reuse a SEQ
 
@@ -132,10 +161,8 @@ although the cloud acked it — while presses with fresh SEQ values ran once. Th
 at 0 per page load too, but polls constantly, so its SEQ at the moment of a press is large and
 different every time. Keep a counter that is stored across restarts and never repeats.
 
-## SMS control (from the manual)
+## SMS control
 
-- `USER<SMS user password> 021 N#1|0` — latch output N on/off.
-- `USER<SMS user password> 022 N#SECONDS#` — pulse output N.
-- `USER…` commands are accepted only from phone numbers registered in the device's user table;
-  `INST<installer password> …` commands from any number.
-- `USER<pw> 100 4` / `100 5` — output states / full system state, replied by SMS.
+Summary of all SMS commands from the PROGATE manual: [SMS.md](SMS.md). The ones that matter
+here: `USER<code> 022 N#SECONDS#` pulses output N (the SMS twin of CMD 6), `INST<pw> 009 …` sets
+the cloud server, port, keep-alive and App Key, `INST<pw> 010 1|0` turns the cloud link on/off.
