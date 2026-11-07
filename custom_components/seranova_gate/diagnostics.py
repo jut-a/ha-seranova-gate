@@ -68,6 +68,8 @@ async def async_get_config_entry_diagnostics(
         "stats": dict(hub.stats),
         "recent_commands": list(hub.recent_commands),
         "recent_state_checks": list(hub.recent_state_checks),
+        # The event log holds names and phone numbers: only its size here.
+        "event_log_size": len(hub.event_log),
         "recent_events": list(hub.recent_events),
         "recent_sessions": list(hub.recent_sessions),
         "sysinfo": _redact_strings(hub.sysinfo),

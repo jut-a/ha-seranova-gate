@@ -11,6 +11,7 @@ from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
+    OptionsFlowWithReload,
 )
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import callback
@@ -39,6 +40,7 @@ from .api import (
 )
 from .const import (
     CONF_APP_KEY,
+    CONF_EVENT_LOG_DAYS,
     CONF_IMEI,
     CONF_POLL_MINUTES,
     CONF_PULSE_LOCKOUT,
@@ -321,8 +323,13 @@ class SeranovaConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
 
-class SeranovaOptionsFlow(OptionsFlow):
-    """Outputs (name, pulse length) and the status poll interval."""
+class SeranovaOptionsFlow(OptionsFlowWithReload):
+    """Outputs, poll interval, lockout and event log days; reloads the entry when saved.
+
+    Home Assistant reloads the entry itself (no update listener: an entry with one
+    makes reconfigure/reauth's async_update_reload_and_abort a deprecated pattern,
+    which stops working in Home Assistant 2026.12).
+    """
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Single form."""
@@ -347,6 +354,11 @@ class SeranovaOptionsFlow(OptionsFlow):
             vol.Required(CONF_PULSE_LOCKOUT): NumberSelector(
                 NumberSelectorConfig(
                     min=0, max=300, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="s"
+                )
+            ),
+            vol.Required(CONF_EVENT_LOG_DAYS): NumberSelector(
+                NumberSelectorConfig(
+                    min=0, max=36500, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="d"
                 )
             ),
         }

@@ -90,7 +90,7 @@ USER<SMS user code> 022 1#2#
 | Command | What it does |
 | --- | --- |
 | `008 APN#LOGIN#PSW#` | Mobile data settings, up to 31 characters each, e.g. `008 internet###`. |
-| `009 ADDR#PORT#PING#KEY#` | Cloud connection. Default `cloud.topkodas.lt#10000#600#123456#`: server, TCP port, keep-alive in seconds, **App Key** (the key this integration asks for). Topkodas recommends keeping the defaults. |
+| `009 ADDR#PORT#PING#KEY#` | Cloud connection. Default `cloud.topkodas.lt#10000#600#123456#`: server, TCP port, keep-alive in seconds, **App Key** (the key this integration asks for). Topkodas recommends keeping the defaults. **Caution:** in testing, a new 6-digit App Key set with `009` (answered "OK") and in the SERANOVA app took the device offline — the cloud reported it offline, the app too — until the key was set back to `123456` on the device and in the app. To protect the cloud path, change your user access code in SERA2 instead. |
 | `010 E` | SERA Cloud Service on (`1`) / off (`0`). Needed for the app and this integration; turn it off when the SIM has no data plan. |
 | `007 P#PER#HH:mm#` | Periodic test report: `P` = `0` off, `1` every PER days, `2` every PER hours (1–99999), at HH:mm. |
 

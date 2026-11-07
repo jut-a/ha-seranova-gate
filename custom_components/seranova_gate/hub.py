@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import Callable
 import contextlib
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -40,20 +40,25 @@ from .const import (
     CMD_PREPARE,
     CMD_SYSTEM,
     CONF_APP_KEY,
+    CONF_EVENT_LOG_DAYS,
     CONF_IMEI,
     CONF_PULSE_LOCKOUT,
     CONF_SYSTEM_NAME,
     CONF_USER_CODE,
     CONFIRMED_PULSE_GUARD,
+    DEFAULT_EVENT_LOG_DAYS,
     DEFAULT_PULSE_LOCKOUT,
     DEFAULT_PULSE_SECONDS,
     DOMAIN,
     ERR_DEVICE_OFFLINE,
     EVENT_DEVICE,
+    EVENT_LOG_SAVE_DELAY,
+    EVENT_LOG_STORAGE_VERSION,
     MANUFACTURER,
     MAX_OUTPUTS,
     MODEL,
     PULSE_CONFIRM_TIMEOUT,
+    RECONNECT_MAX,
     RECONNECT_MIN,
     REFUSAL_ERRORS,
     SEND_INTERVAL,
@@ -63,6 +68,7 @@ from .const import (
     SEQ_RESTART_GAP,
     SEQ_SAVE_DELAY,
     SEQ_STORAGE_VERSION,
+    SHORT_SESSION_SECONDS,
     STATE_MAX_AGE,
     WAKE_INTERVAL,
     WAKE_RETRIES,
@@ -88,6 +94,14 @@ class DeviceRefused(SeranovaError):
 
 class CommandTimeout(SeranovaError):
     """No acknowledgement after all re-sends."""
+
+
+class DeviceUnavailable(SeranovaError):
+    """The cloud or the gate controller cannot be used now; setup should retry later."""
+
+
+class LoginRejected(DeviceUnavailable):
+    """SERANOVA rejected the stored login; the user has to re-authenticate."""
 
 
 @dataclass(slots=True)
@@ -126,6 +140,41 @@ def _frame_kind(frame: dict[str, Any]) -> str:
 def seq_storage_key(entry_id: str) -> str:
     """Storage key of one entry's frame counter."""
     return f"{DOMAIN}.{entry_id}.seq"
+
+
+def event_log_storage_key(imei: str) -> str:
+    """Storage key of one device's event audit log (per device, not per entry)."""
+    return f"{DOMAIN}.{imei}.events"
+
+
+def reconnect_delay(backoff: float, session_seconds: float | None) -> tuple[float, float]:
+    """Return (seconds to wait before the next connect, the next backoff).
+
+    session_seconds is None when the connect itself failed. A session that lasted
+    SHORT_SESSION_SECONDS or more was a working one: come back quickly and restart
+    the backoff. A failed connect, or a session the server closed within seconds
+    (it does that for every session while the device is offline), waits `backoff`
+    and doubles it, up to RECONNECT_MAX.
+    """
+    if session_seconds is not None and session_seconds >= SHORT_SESSION_SECONDS:
+        return RECONNECT_MIN, RECONNECT_MIN
+    return backoff, min(backoff * 2, RECONNECT_MAX)
+
+
+def logged_time(entry: dict[str, Any]) -> datetime | None:
+    """The time of an audit log entry (UTC), None if it cannot be read."""
+    if isinstance(stamp := entry.get("time"), str) and (parsed := dt_util.parse_datetime(stamp)):
+        return dt_util.as_utc(parsed)
+    return None
+
+
+def event_time(data: dict[str, Any], received: datetime) -> datetime:
+    """When an event happened: the device's own clock, else when it was received."""
+    if isinstance(stamp := data.get("device_time"), str) and (
+        parsed := dt_util.parse_datetime(stamp)
+    ):
+        return dt_util.as_utc(parsed)
+    return received
 
 
 def pulse_confirmation(frame: dict[str, Any]) -> str | None:
@@ -314,7 +363,6 @@ class SeranovaHub:
         self._listeners: list[Callable[[], None]] = []
         self._event_listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._closing = False
-        self._down_logged = False
         self._established = False
         self._session_started = 0.0
         self._lost_at: float | None = None
@@ -325,6 +373,22 @@ class SeranovaHub:
         self.recent_events: deque[dict[str, Any]] = deque(maxlen=20)
         self.recent_state_checks: deque[dict[str, Any]] = deque(maxlen=20)
         self._device_checked = False
+        self._reconnect_now = asyncio.Event()
+        self._short_sessions_in_a_row = 0
+        self._connect_failures_in_a_row = 0
+        self._unanswered_in_a_row = 0
+        self._reload_requested = False
+        # Resolved when the device first answers a state request; setup waits for it.
+        self._ready: asyncio.Future[None] = hass.loop.create_future()
+        self._ready.add_done_callback(lambda f: f.cancelled() or f.exception())
+        # Event audit log (HA storage, outside the recorder), oldest first.
+        self.event_log: list[dict[str, Any]] = []
+        self._event_log_days = int(
+            entry.options.get(CONF_EVENT_LOG_DAYS, DEFAULT_EVENT_LOG_DAYS)
+        )
+        self._event_log_store: Store[dict[str, Any]] = Store(
+            hass, EVENT_LOG_STORAGE_VERSION, event_log_storage_key(self.imei)
+        )
         self.stats: dict[str, int] = dict.fromkeys(
             (
                 "pulses_requested",
@@ -334,6 +398,7 @@ class SeranovaHub:
                 "pulses_not_sent",
                 "state_checks",
                 "state_checks_unanswered",
+                "short_sessions",
                 "events_received",
                 "sessions_ended",
                 "connect_failures",
@@ -390,39 +455,90 @@ class SeranovaHub:
 
     async def async_run(self) -> None:
         """Keep a socket open until the entry unloads (runs as a background task)."""
-        backoff = RECONNECT_MIN
+        backoff: float = RECONNECT_MIN
         while not self._closing:
             self._established = False
             try:
                 await self._connect_and_read()
             except (InvalidAuth, TwoFactorRequired) as err:
                 self.last_error = f"login rejected: {err!r}"
-                _LOGGER.warning("SERANOVA login rejected, asking to re-authenticate")
-                self.entry.async_start_reauth(self.hass)
+                if self._ready.done():
+                    _LOGGER.warning("SERANOVA login rejected, asking to re-authenticate")
+                    self.entry.async_start_reauth(self.hass)
+                else:
+                    self._ready.set_exception(LoginRejected("SERANOVA rejected the login"))
                 return
             except (SeranovaError, aiohttp.ClientError, TimeoutError) as err:
                 if self._closing:
                     return
                 reason = str(err) or type(err).__name__
                 if self._established:
+                    self._connect_failures_in_a_row = 0
                     self._record_session_end(reason)
                 else:
                     self.last_error = reason
                     self.stats["connect_failures"] += 1
-                    log = _LOGGER.debug if self._down_logged else _LOGGER.warning
-                    log("Cannot reach the SERANOVA cloud (%s); retrying", reason)
-                    self._down_logged = True
+                    self._connect_failures_in_a_row += 1
+                    _LOGGER.debug("Cannot reach the SERANOVA cloud (%s)", reason)
+                    if self._connect_failures_in_a_row >= (3 if self._ready.done() else 2):
+                        self._set_unavailable(f"cannot reach the SERANOVA cloud ({reason})")
             finally:
                 self._drop_connection()
-            if self._established:
-                # A working session ended (the server closes them routinely):
-                # come back quickly and restart the failure backoff.
-                backoff = RECONNECT_MIN
-                delay = RECONNECT_MIN
-            else:
-                delay = backoff
-                backoff = min(backoff * 2, 300)
-            await asyncio.sleep(delay)
+            session = time.monotonic() - self._session_started if self._established else None
+            delay, backoff = reconnect_delay(backoff, session)
+            self._note_session_length(session, delay)
+            await self._wait_before_reconnect(delay)
+
+    @callback
+    def _note_session_length(self, session: float | None, delay: float) -> None:
+        if session is None:
+            return  # a failed connect, logged where it happened
+        if session >= SHORT_SESSION_SECONDS:
+            self._short_sessions_in_a_row = 0
+            return
+        self.stats["short_sessions"] += 1
+        self._short_sessions_in_a_row += 1
+        _LOGGER.debug("Cloud session closed after %.1f s; reconnecting in %.0f s", session, delay)
+        if self._short_sessions_in_a_row >= 3:
+            self._set_unavailable(
+                "the SERANOVA cloud keeps closing the session within seconds "
+                "(is the gate controller offline?)"
+            )
+
+    @callback
+    def _set_unavailable(self, reason: str) -> None:
+        """The cloud or device cannot be used: fail the setup, or set the entry up again.
+
+        Setting it up again makes Home Assistant show the integration as "Retrying
+        setup" with the reason, and retry on its own schedule until the gate
+        controller answers a state request.
+        """
+        self.last_error = reason
+        if not self._ready.done():
+            self._ready.set_exception(DeviceUnavailable(reason))
+            return
+        if self._reload_requested or self._closing:
+            return
+        self._reload_requested = True
+        _LOGGER.warning("Gate controller unavailable: %s; setting the integration up again", reason)
+        self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
+
+    async def async_wait_ready(self, timeout: float) -> None:
+        """Wait until the gate controller has answered a state request (for setup)."""
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(self._ready)
+        except TimeoutError as err:
+            raise DeviceUnavailable(
+                f"the gate controller did not answer within {timeout:.0f} s"
+            ) from err
+
+    async def _wait_before_reconnect(self, delay: float) -> None:
+        """Sleep `delay` seconds, or less when a command needs the connection now."""
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(delay):
+                await self._reconnect_now.wait()
+        self._reconnect_now.clear()
 
     @callback
     def _record_session_end(self, reason: str) -> None:
@@ -470,10 +586,9 @@ class SeranovaHub:
             self._grace_unsub()
             self._grace_unsub = None
         self._connected.set()
-        if self._down_logged:
-            _LOGGER.info("SERANOVA cloud connection restored")
+        if self._connect_failures_in_a_row:
             self.last_error = None
-        self._down_logged = False
+        self._connect_failures_in_a_row = 0
         _LOGGER.debug(
             "Cloud session established (ping every %s ms)", conn.greeting.get("pingInterval")
         )
@@ -520,6 +635,7 @@ class SeranovaHub:
         if conn is not None:
             await conn.close()
         await self._seq_store.async_save(self._seq_data())
+        await self._event_log_store.async_save(self._event_log_data())
 
     # ---- incoming frames -------------------------------------------------
 
@@ -541,6 +657,8 @@ class SeranovaHub:
                 key = f"ERROR{error}"
             self.last_frames[key] = {"received": dt_util.utcnow().isoformat(), "frame": frame}
 
+            if error == ERR_DEVICE_OFFLINE and not self._ready.done():
+                self._set_unavailable("the SERANOVA cloud reports the gate controller offline")
             if error == ERR_DEVICE_OFFLINE and self.device_online is not False:
                 self.device_online = False
                 changed = True
@@ -573,6 +691,7 @@ class SeranovaHub:
         event_type, data = parse_event(event if isinstance(event, dict) else {})
         if event_type == "access_granted":
             self._last_access_at = time.monotonic()
+        self._log_event(event_type, data)
         self.stats["events_received"] += 1
         self.recent_events.append(
             {
@@ -590,6 +709,84 @@ class SeranovaHub:
             EVENT_DEVICE,
             {"config_entry_id": self.entry.entry_id, "type": event_type, **data},
         )
+
+    # ---- event audit log -------------------------------------------------
+
+    async def async_load_event_log(self) -> None:
+        """Load the device's event log and drop entries older than the kept days."""
+        data = await self._event_log_store.async_load()
+        events = data.get("events") if isinstance(data, dict) else None
+        self.event_log = [e for e in events if isinstance(e, dict)] if events else []
+        if self._trim_event_log():
+            await self._event_log_store.async_save(self._event_log_data())
+
+    def _event_log_data(self) -> dict[str, Any]:
+        return {"events": self.event_log}
+
+    def _trim_event_log(self) -> bool:
+        """Drop entries older than the kept days (0 keeps all); True if any were dropped."""
+        if self._event_log_days <= 0 or not self.event_log:
+            return False
+        cutoff = dt_util.utcnow() - timedelta(days=self._event_log_days)
+        kept = [
+            e for e in self.event_log if (stamp := logged_time(e)) is None or stamp >= cutoff
+        ]
+        dropped = len(kept) != len(self.event_log)
+        self.event_log = kept
+        return dropped
+
+    @callback
+    def _log_event(self, event_type: str, data: dict[str, Any]) -> None:
+        received = dt_util.utcnow()
+        self.event_log.append(
+            {
+                "time": event_time(data, received).isoformat(),
+                "received": received.isoformat(),
+                "type": event_type,
+                **{
+                    key: data.get(key)
+                    for key in (
+                        "message",
+                        "subject",
+                        "subject_detail",
+                        "user_or_zone",
+                        "partition",
+                        "code",
+                        "cid",
+                        "device_time",
+                    )
+                },
+            }
+        )
+        self._trim_event_log()
+        self._event_log_store.async_delay_save(self._event_log_data, EVENT_LOG_SAVE_DELAY)
+
+    def get_events(
+        self,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Logged events, newest first, filtered by time and type.
+
+        Stored in arrival order; an event delivered late can sit after a newer one,
+        so the whole log is scanned and sorted.
+        """
+        low = dt_util.as_utc(since) if since else None
+        high = dt_util.as_utc(until) if until else None
+        found: list[tuple[datetime, dict[str, Any]]] = []
+        for entry in self.event_log:
+            stamp = logged_time(entry)
+            if stamp is None:
+                continue
+            if (low is not None and stamp < low) or (high is not None and stamp > high):
+                continue
+            if event_type is not None and entry.get("type") != event_type:
+                continue
+            found.append((stamp, entry))
+        found.sort(key=lambda item: item[0], reverse=True)
+        return [dict(entry) for _, entry in found[:limit]]
 
     # ---- commands --------------------------------------------------------
 
@@ -641,6 +838,7 @@ class SeranovaHub:
 
     async def _ensure_connected(self, timeout: float = 15) -> SocketIoConnection:
         if self._conn is None or not self._conn.connected:
+            self._reconnect_now.set()  # cut a reconnect backoff short
             try:
                 async with asyncio.timeout(timeout):
                     await self._connected.wait()
@@ -889,9 +1087,16 @@ class SeranovaHub:
         }
         self.recent_state_checks.append(entry)
         self.stats["state_checks"] += 1
-        if not answered:
-            self.stats["state_checks_unanswered"] += 1
         self._device_checked = True
+        if answered:
+            self._unanswered_in_a_row = 0
+            if not self._ready.done():
+                self._ready.set_result(None)
+        else:
+            self.stats["state_checks_unanswered"] += 1
+            self._unanswered_in_a_row += 1
+            if not self._ready.done() or self._unanswered_in_a_row >= 2:
+                self._set_unavailable("the gate controller did not answer a state request")
         _LOGGER.debug("State check: %s", entry)
 
     async def async_poll(self, _now: datetime | None = None) -> None:
@@ -924,9 +1129,10 @@ class SeranovaHub:
                     CMD_INFO, "", self._user_code, _Waiter(None, CMD_INFO), retries=2, interval=5
                 )
             except DeviceRefused as err:
-                self.last_error = str(err)
-                self._notify()
+                self._set_unavailable(str(err))  # wrong App Key / user code / IMEI
                 return
+            except CommandTimeout:
+                pass  # no info reply: the state check below decides
             except SeranovaError:
                 return
         if not self._device_checked:
