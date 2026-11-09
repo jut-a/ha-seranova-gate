@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Manifest `categories`: `blinds_curtains` (gates and garage doors) and
+  `security_safety.locks_access`, for browsing by category in the Marketplace.
+
+### Documentation
+- README leads with the product name (Topkodas PROGATE GSM gate controller), names the
+  device as it appears in the app, SERA2 and on its label, adds a Lithuanian summary and an FAQ.
+
 ## 0.2.5
 
 ### Fixed

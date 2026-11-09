@@ -1,6 +1,7 @@
 {
   "domain": "seranova_gate",
   "name": "Seranova Gate (Topkodas PROGATE)",
+  "categories": ["blinds_curtains", "security_safety.locks_access"],
   "codeowners": ["@jut-a"],
   "config_flow": true,
   "dependencies": [],
