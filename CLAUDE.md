@@ -21,7 +21,9 @@ controller via the SERANOVA cloud. Public repo: https://github.com/jut-a/ha-sera
 - Storage (`.storage/`): `seranova_gate.<entry_id>.seq` (frame counter, deleted with the entry)
   and `seranova_gate.<IMEI>.events` (the event audit log; per device, kept when the entry is
   removed, trimmed only by the `event_log_days` option).
-- `hacs.json`, `.github/workflows/validate.yaml` (hassfest + HACS action, brands ignored).
+- `hacs.json`, `.github/workflows/validate.yaml` (hassfest + HACS action, no ignored checks).
+- `custom_components/seranova_gate/brand/` — `icon.png` (256 px) + `icon@2x.png` (512 px), an
+  original gate + signal glyph (no Home Assistant or Topkodas logos), trimmed, transparent.
 
 ## Hard rules
 
@@ -104,9 +106,9 @@ Live: there is no simulator; test against a real device while someone watches th
 
 - Same catalog, same `hacs.json`; users install from Settings → Marketplace, or "Add from
   link" with the repo URL (needs a **public** repo).
-- The `brands` check passes with an icon shipped in the integration:
+- The `brands` check passes with the icon shipped in the integration:
   `custom_components/seranova_gate/brand/icon.png` (no Home Assistant or Topkodas logos).
-  Until that exists the workflow ignores `brands`; the default catalog does not accept ignored
+  Never add an `ignore:` to the HACS action — the default catalog does not accept ignored
   checks. The catalog also wants repo topics, a description and issues enabled (the HACS
   `images` check applies to plugins and themes only). The HACS action reads these through
   the GitHub API, so it fails while the repo is private or missing them.

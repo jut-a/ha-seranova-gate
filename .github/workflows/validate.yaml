@@ -20,8 +20,6 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Until custom_components/seranova_gate/brand/icon.png exists.
-          ignore: brands
 
   lint:
     runs-on: ubuntu-latest
