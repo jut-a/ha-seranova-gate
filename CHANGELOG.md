@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+- Brand icon (`brand/icon.png`, `icon@2x.png`), shown on the integration's page and in the
+  Marketplace.
+
 ### Changed
 - Manifest `categories`: `blinds_curtains` (gates and garage doors) and
   `security_safety.locks_access`, for browsing by category in the Marketplace.
