@@ -1,14 +1,26 @@
-# Seranova Gate — Home Assistant integration for the Topkodas PROGATE
+# Topkodas PROGATE (SERANOVA) — Home Assistant integration
 
 [![Open your Home Assistant instance and open a repository in the Marketplace.](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=jut-a&repository=ha-seranova-gate&category=integration)
 [![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=seranova_gate)
 
-Control a **Topkodas PROGATE** cellular gate controller from Home Assistant through the
-**SERANOVA** cloud (the same cloud the SERANOVA app and [seranova.eu](https://seranova.eu) use).
+Unofficial Home Assistant integration for the **Topkodas PROGATE** GSM gate controller.
+Open a sliding or swing gate, barrier or garage door from Home Assistant dashboards,
+automations or voice, through the **SERANOVA** cloud (the same cloud the SERANOVA app and
+[seranova.eu](https://seranova.eu) use). No SMS, no phone call, no SMS costs. See who
+opened the gate and when.
+
+Also known as: the PROGATE "GSM Controller" (front label), configured with SERA2,
+controlled with the SERANOVA app. Works with the default SERA Cloud Service
+(`cloud.topkodas.lt`).
+
+**Lietuviškai:** neoficiali Home Assistant integracija Topkodas PROGATE GSM vartų
+valdikliui. Stumdomus ar varstomus vartus, užkardą (šlagbaumą) ar garažo vartus galite
+atidaryti iš Home Assistant per SERANOVA debesį, be SMS ir be skambučio, ir matyti,
+kas ir kada atidarė vartus.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/jut-a/ha-seranova-gate/main/docs/progate.png"
-       alt="Topkodas PROGATE GSM controller" width="280"><br>
+       alt="Topkodas PROGATE GSM gate controller (&quot;GSM Controller&quot;)" width="280"><br>
   <sub>Topkodas PROGATE. Product photo: Topkodas.</sub>
 </p>
 
@@ -313,6 +325,36 @@ pulse stops or reverses the gate. The integration therefore:
 
 If your PROGATE relay is wired to an "open only" input, extra pulses are harmless and you can
 set the minimum time to `0`. Details in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+## FAQ
+
+### Can I open a PROGATE gate from Home Assistant without SMS?
+
+Yes. The integration sends the same command the SERANOVA app sends, through the SERANOVA
+cloud, so no SMS or call is made and nothing is charged per opening. The PROGATE needs SERA
+Cloud Service on and a SIM with mobile data; an SMS-only setup is not supported.
+
+### Does it work with the SERANOVA app at the same time?
+
+Yes. Both use the same cloud and the same account, and every access the PROGATE reports
+shows up in Home Assistant, whoever made it. Keep the App Key the same in the app, on the
+device and in Home Assistant.
+
+### Can Home Assistant open the gate automatically when I arrive by car?
+
+Yes, with an automation on your phone's location and driving activity. See
+[Example: open the gate when arriving by car](#example-open-the-gate-when-arriving-by-car).
+
+### Does it need a local connection or extra hardware?
+
+No. Nothing beyond the PROGATE itself: it talks to the cloud over its own SIM, and Home
+Assistant only needs internet access. If the cloud is down, calls and SMS to the PROGATE
+keep working.
+
+### Can I see who opened the gate?
+
+Yes. Every access the PROGATE reports arrives as an event (for example
+`Access Gained by John (User 1)`) and is kept in the integration's event log.
 
 ## Troubleshooting
 
