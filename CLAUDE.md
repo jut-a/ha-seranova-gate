@@ -64,10 +64,14 @@ Automated (CI runs pytest and ruff on every push):
   which HA logs "Detected that custom integration 'seranova_gate' …" or "The deprecated … was
   called from seranova_gate". The message names the replacement and the HA version that
   removes the old API — fix it then, don't filter the message.
-- `.github/workflows/ha-beta.yaml` (Thursdays + manual): the tests on the newest HA from PyPI,
-  beta included, installed over the pinned kit — about a week's warning before each release.
-  Not run on PRs (never blocks a merge); a red run e-mails the owner. It can fail because the
-  kit doesn't match the newer HA — read the log first.
+- `.github/workflows/ha-beta.yaml` (Thursdays + manual): `script/check_ha_imports.py` on the
+  newest HA from PyPI, beta included — imports every module, fails on an import error (removed
+  or renamed API) or a deprecation naming `seranova_gate` (e.g. a deprecated constant). About a
+  week's warning before each release. Not run on PRs; a red run e-mails the owner. **It
+  deliberately does not run pytest:** the test kit is built for one stable release, has no
+  beta builds, and its copied helpers break on the next HA (kit 2026.10.4 on HA 2026.11.0:
+  `httpx was already imported`, then `cannot import name '_clear_logger_overwrites'`). Run it
+  locally with `python script/check_ha_imports.py` in any env that has `homeassistant`.
 - Test frames with an old device `TIME` that must count as the *same* stored copy are stamped
   once (`stored_copy_script`); two `state(age=…)` calls can differ by a second, and a newer
   `TIME` is correctly accepted as a device with a wrong clock (this made CI flaky).
