@@ -1,12 +1,17 @@
 name: Home Assistant beta
 
-# The tests against the newest Home Assistant on PyPI, beta included, on top of the
-# pinned test kit. Home Assistant betas come out on the last Wednesday of the month,
-# a week before the release; Dependabot's test-kit bump only arrives after the release.
+# Imports the integration into the newest Home Assistant on PyPI, beta included
+# (script/check_ha_imports.py): fails on a module that no longer imports (a removed or
+# renamed API) or a deprecation Home Assistant logs naming this integration. Betas come
+# out on the last Wednesday of the month, a week before the release.
+#
+# Home Assistant only, no test kit: the kit is built for one stable release and its
+# copied helpers break on the next one (2026.11.0 vs kit 2026.10.4: httpx alias,
+# removed logger helper), and it has no beta builds. The full tests against a new
+# release run on Dependabot's test-kit bump PR.
+#
 # Not run on pushes or PRs, so it never blocks a merge: a red scheduled run e-mails the
-# repo owner. A failure can also be the test kit not matching the newer Home Assistant
-# (its helpers are copied from one Home Assistant release) - read the log before
-# changing the integration.
+# repo owner.
 
 on:
   schedule:
@@ -14,21 +19,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  tests:
+  imports:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
-          cache: pip
-          cache-dependency-path: requirements_test.txt
-      - run: pip install -r requirements_test.txt
-      # pip warns that the test kit pins an older homeassistant; that is expected.
-      - run: pip install --upgrade --pre homeassistant
-      - name: Home Assistant version
-        run: |
-          version=$(python -c "from homeassistant.const import __version__; print(__version__)")
-          echo "Testing against Home Assistant $version"
-          echo "Tested against Home Assistant **$version**" >> "$GITHUB_STEP_SUMMARY"
-      - run: pytest -q
+      - run: pip install --pre homeassistant
+      # Failures show as ::error:: annotations on the run page.
+      - run: python script/check_ha_imports.py
